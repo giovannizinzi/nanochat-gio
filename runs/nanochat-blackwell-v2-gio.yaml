@@ -1,0 +1,152 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: nanochat-blackwell-v2-gio
+  namespace: default   # MUST match the PVC's namespace
+spec:
+  restartPolicy: Never
+  nodeSelector:
+    kubernetes.io/hostname: g1fc512
+  containers:
+  - name: nanochat-blackwell-v2-gio
+    image: nvcr.io/nvidia/pytorch:25.12-py3
+    workingDir: /workspace
+    resources:
+      requests:
+        nvidia.com/gpu: 8
+        cpu: 100
+        memory: 800Gi
+      limits:
+        nvidia.com/gpu: 8
+        cpu: 100
+        memory: 800Gi
+    volumeMounts:
+    - name: dshm
+      mountPath: /dev/shm
+    - name: workspace
+      mountPath: /workspace
+    # Mounts your 1Ti PVC to /data
+    - name: persistent-storage
+      mountPath: /data
+    env:
+    - name: HOME
+      value: /workspace
+    - name: NCCL_DEBUG
+      value: "INFO"
+    - name: NCCL_IB_DISABLE
+      value: "1"
+    - name: TORCH_NCCL_ASYNC_ERROR_HANDLING
+      value: "1"
+    - name: NCCL_NET
+      value: "Socket"
+    - name: NCCL_NET_PLUGIN
+      value: "none"
+    - name: PIP_ROOT_USER_ACTION
+      value: "ignore"
+    # Tells nanochat to write all checkpoints/data to the PVC
+    - name: NANOCHAT_BASE_DIR
+      value: "/data/nanochat-gio"
+    command: ["/bin/bash", "-c"]
+    args:
+    - |
+      set -e
+      echo "====================================="
+      echo "NanoChat Blackwell v2 (gio)"
+      echo "====================================="
+      echo "Start time: $(date)"
+      echo "Running on: $(hostname)"
+
+      export HOME=/workspace
+      export OMP_NUM_THREADS=1
+      mkdir -p "$NANOCHAT_BASE_DIR"
+
+      # System deps for git/curl/build
+      echo ">>> Installing system dependencies..."
+      apt-get update && apt-get install -y git curl build-essential
+
+      # Install Rust
+      export RUSTUP_HOME=/workspace/.rustup
+      export CARGO_HOME=/workspace/.cargo
+      curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+      source "$CARGO_HOME/env"
+
+      # Clone nanochat repository to persistent storage
+      cd /data/nanochat-gio
+      if [ -d "nanochat" ]; then
+        REMOTE_URL=$(git -C nanochat config --get remote.origin.url || true)
+        if [ "$REMOTE_URL" != "https://github.com/giovannizinzi/nanochat-gio.git" ] && [ "$REMOTE_URL" != "git@github.com:giovannizinzi/nanochat-gio.git" ]; then
+          echo ">>> Existing repo is not nanochat-gio (origin: $REMOTE_URL). Re-cloning..."
+          rm -rf nanochat
+        fi
+      fi
+      if [ ! -d "nanochat" ]; then
+        echo ">>> Cloning nanochat repository..."
+        git clone https://github.com/giovannizinzi/nanochat-gio.git nanochat
+      else
+        echo ">>> Updating nanochat repository..."
+        cd nanochat && git pull && cd ..
+      fi
+      cd nanochat
+
+      # Install Python dependencies
+      # Work around setuptools flat-layout discovery by providing an explicit package list
+      printf 'from setuptools import setup\nsetup(name="nanochat", version="0.0.0", packages=["nanochat"])\n' > setup.py
+      PIP_DISABLE_PEP517=1 SETUPTOOLS_DISABLE_AUTO_DISCOVERY=1 pip install -e .
+      pip install maturin
+
+      # Build Tokenizer (if rustbpe source exists)
+      if [ -f rustbpe/Cargo.toml ]; then
+        echo ">>> Building Rust Tokenizer..."
+        rm -rf rustbpe/target/wheels
+        maturin build --release --manifest-path rustbpe/Cargo.toml
+        WHEEL_FILE=$(find rustbpe/target/wheels -name "*.whl" | head -n 1)
+        pip install "$WHEEL_FILE"
+      else
+        echo ">>> rustbpe source not found; skipping local build."
+      fi
+
+      # -----------------------------------------------------------------------------
+      # wandb setup
+      if [ -z "$WANDB_RUN" ]; then
+        WANDB_RUN=dummy
+      fi
+
+      # -----------------------------------------------------------------------------
+      # Report reset
+      python -m nanochat.report reset
+
+      # -----------------------------------------------------------------------------
+      # Tokenizer
+      python -m nanochat.dataset -n 8
+      python -m nanochat.dataset -n 370 &
+      DATASET_DOWNLOAD_PID=$!
+      python -m scripts.tok_train
+      python -m scripts.tok_eval
+
+      # -----------------------------------------------------------------------------
+      # Base model (pretraining)
+      echo "Waiting for dataset download to complete..."
+      wait $DATASET_DOWNLOAD_PID
+
+      torchrun --standalone --nproc_per_node=8 -m scripts.base_train -- --depth=24 --target-param-data-ratio=12 --device-batch-size=16 --run=$WANDB_RUN
+      torchrun --standalone --nproc_per_node=8 -m scripts.base_eval -- --device-batch-size=16
+
+      # -----------------------------------------------------------------------------
+      # SFT
+      curl -L -o $NANOCHAT_BASE_DIR/identity_conversations.jsonl https://karpathy-public.s3.us-west-2.amazonaws.com/identity_conversations.jsonl
+      torchrun --standalone --nproc_per_node=8 -m scripts.chat_sft -- --device-batch-size=16 --run=$WANDB_RUN
+      torchrun --standalone --nproc_per_node=8 -m scripts.chat_eval -- -i sft
+
+      # -----------------------------------------------------------------------------
+      # Generate report
+      python -m nanochat.report generate
+
+  volumes:
+  - name: dshm
+    emptyDir:
+      medium: Memory
+  - name: workspace
+    emptyDir: {}
+  - name: persistent-storage
+    persistentVolumeClaim:
+      claimName: bribri-test-storage  # UPDATED NAME
