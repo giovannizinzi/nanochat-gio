@@ -20,6 +20,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from nanochat.common import get_dist_info, print0
+from nanochat.fp8 import LinearFP8LMHead, LinearMXFP8, fp8_available, linear_dims_supported, block_size_supported
 from nanochat.optim import MuonAdamW, DistMuonAdamW
 
 # Our custom Flash Attention module that automatically uses FA3 on Hopper+ and SDPA fallback elsewhere
@@ -37,6 +38,11 @@ class GPTConfig:
     # Characters: L=long (full context), S=short (half context)
     # Examples: "L"=all full context, "SL"=alternating, "SSL"=two short then one long
     window_pattern: str = "SSSL"
+    use_fp8_lm_head: bool = False
+    use_mxfp8_lm_head: bool = False
+    use_mxfp8: bool = False
+    mxfp8_block_size: int = 16
+    mxfp8_monitor: bool = False
 
 
 def norm(x):
@@ -66,11 +72,20 @@ class CausalSelfAttention(nn.Module):
         self.head_dim = self.n_embd // self.n_head
         assert self.n_embd % self.n_head == 0
         assert self.n_kv_head <= self.n_head and self.n_head % self.n_kv_head == 0
-        self.c_q = nn.Linear(self.n_embd, self.n_head * self.head_dim, bias=False)
-        self.c_k = nn.Linear(self.n_embd, self.n_kv_head * self.head_dim, bias=False)
-        self.c_v = nn.Linear(self.n_embd, self.n_kv_head * self.head_dim, bias=False)
-        self.c_proj = nn.Linear(self.n_embd, self.n_embd, bias=False)
+        if config.use_mxfp8:
+            self.c_q = LinearMXFP8(self.n_embd, self.n_head * self.head_dim, bias=False, block_size=config.mxfp8_block_size)
+            self.c_k = LinearMXFP8(self.n_embd, self.n_kv_head * self.head_dim, bias=False, block_size=config.mxfp8_block_size)
+            self.c_v = LinearMXFP8(self.n_embd, self.n_kv_head * self.head_dim, bias=False, block_size=config.mxfp8_block_size)
+            self.c_proj = LinearMXFP8(self.n_embd, self.n_embd, bias=False, block_size=config.mxfp8_block_size)
+            for m in (self.c_q, self.c_k, self.c_v, self.c_proj):
+                m.monitor = config.mxfp8_monitor
+        else:
+            self.c_q = nn.Linear(self.n_embd, self.n_head * self.head_dim, bias=False)
+            self.c_k = nn.Linear(self.n_embd, self.n_kv_head * self.head_dim, bias=False)
+            self.c_v = nn.Linear(self.n_embd, self.n_kv_head * self.head_dim, bias=False)
+            self.c_proj = nn.Linear(self.n_embd, self.n_embd, bias=False)
         self.ve_gate_channels = 32
+        # Keep ve_gate in BF16 to avoid small-dim MXFP8 inefficiencies
         self.ve_gate = nn.Linear(self.ve_gate_channels, self.n_kv_head, bias=False) if has_ve(layer_idx, config.n_layer) else None
 
     def forward(self, x, ve, cos_sin, window_size, kv_cache):
@@ -121,8 +136,14 @@ class CausalSelfAttention(nn.Module):
 class MLP(nn.Module):
     def __init__(self, config):
         super().__init__()
-        self.c_fc = nn.Linear(config.n_embd, 4 * config.n_embd, bias=False)
-        self.c_proj = nn.Linear(4 * config.n_embd, config.n_embd, bias=False)
+        if config.use_mxfp8:
+            self.c_fc = LinearMXFP8(config.n_embd, 4 * config.n_embd, bias=False, block_size=config.mxfp8_block_size)
+            self.c_proj = LinearMXFP8(4 * config.n_embd, config.n_embd, bias=False, block_size=config.mxfp8_block_size)
+            self.c_fc.monitor = config.mxfp8_monitor
+            self.c_proj.monitor = config.mxfp8_monitor
+        else:
+            self.c_fc = nn.Linear(config.n_embd, 4 * config.n_embd, bias=False)
+            self.c_proj = nn.Linear(4 * config.n_embd, config.n_embd, bias=False)
 
     def forward(self, x):
         x = self.c_fc(x)
@@ -164,7 +185,35 @@ class GPT(nn.Module):
             "wte": nn.Embedding(padded_vocab_size, config.n_embd),
             "h": nn.ModuleList([Block(config, layer_idx) for layer_idx in range(config.n_layer)]),
         })
-        self.lm_head = nn.Linear(config.n_embd, padded_vocab_size, bias=False)
+        if config.use_mxfp8:
+            if not fp8_available():
+                print0("MXFP8 requested but FP8 not supported on this GPU; falling back to BF16")
+                config.use_mxfp8 = False
+            elif not linear_dims_supported(config.n_embd, config.n_embd) or not linear_dims_supported(config.n_embd, 4 * config.n_embd):
+                print0("MXFP8 requested but core Linear dims not multiple of 16; falling back to BF16")
+                config.use_mxfp8 = False
+            elif not block_size_supported(config.mxfp8_block_size):
+                print0("MXFP8 requested but block size unsupported; falling back to BF16")
+                config.use_mxfp8 = False
+
+        if config.use_mxfp8:
+            print0("Using MXFP8 for core Linear layers (pure PyTorch)")
+            self.lm_head = LinearMXFP8(config.n_embd, padded_vocab_size, bias=False, block_size=config.mxfp8_block_size, monitor=config.mxfp8_monitor)
+        elif config.use_mxfp8_lm_head:
+            if not fp8_available():
+                print0("MXFP8 requested but FP8 not supported on this GPU; falling back to BF16 lm_head")
+                self.lm_head = nn.Linear(config.n_embd, padded_vocab_size, bias=False)
+            elif not linear_dims_supported(config.n_embd, padded_vocab_size):
+                print0("MXFP8 requested but lm_head dims not multiple of 16; falling back to BF16 lm_head")
+                self.lm_head = nn.Linear(config.n_embd, padded_vocab_size, bias=False)
+            else:
+                print0("Using MXFP8 lm_head (pure PyTorch)")
+                self.lm_head = LinearMXFP8(config.n_embd, padded_vocab_size, bias=False, block_size=config.mxfp8_block_size)
+        elif config.use_fp8_lm_head and fp8_available():
+            print0("Using FP8 lm_head (Blackwell/Hopper)")
+            self.lm_head = LinearFP8LMHead(config.n_embd, padded_vocab_size, bias=False)
+        else:
+            self.lm_head = nn.Linear(config.n_embd, padded_vocab_size, bias=False)
         # Per-layer learnable scalars (inspired by modded-nanogpt)
         # resid_lambdas: scales the residual stream at each layer (init 1.0 = neutral)
         # x0_lambdas: blends initial embedding back in at each layer (init 0.0 = disabled)

@@ -26,6 +26,21 @@ def _patch_missing_config_keys(model_config_kwargs):
     if "window_pattern" not in model_config_kwargs:
         model_config_kwargs["window_pattern"] = "L"
         log0(f"Patching missing window_pattern in model config to 'L'")
+    if "use_fp8_lm_head" not in model_config_kwargs:
+        model_config_kwargs["use_fp8_lm_head"] = False
+        log0("Patching missing use_fp8_lm_head in model config to False")
+    if "use_mxfp8_lm_head" not in model_config_kwargs:
+        model_config_kwargs["use_mxfp8_lm_head"] = False
+        log0("Patching missing use_mxfp8_lm_head in model config to False")
+    if "use_mxfp8" not in model_config_kwargs:
+        model_config_kwargs["use_mxfp8"] = False
+        log0("Patching missing use_mxfp8 in model config to False")
+    if "mxfp8_block_size" not in model_config_kwargs:
+        model_config_kwargs["mxfp8_block_size"] = 16
+        log0("Patching missing mxfp8_block_size in model config to 16")
+    if "mxfp8_monitor" not in model_config_kwargs:
+        model_config_kwargs["mxfp8_monitor"] = False
+        log0("Patching missing mxfp8_monitor in model config to False")
 
 def _patch_missing_keys(model_data, model_config):
     """Add default values for new parameters that may be missing in old checkpoints."""

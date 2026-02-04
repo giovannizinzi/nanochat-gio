@@ -214,6 +214,9 @@ def get_peak_flops(device_name: str) -> float:
         (["grace blackwell"], 2.5e15),
         (["b200"], 2.25e15),
         (["b100"], 1.8e15),
+        # NVIDIA RTX PRO 6000 Blackwell Server Edition (official FP32 peak)
+        # https://www.nvidia.com/en-us/data-center/rtx-pro-6000-blackwell-server-edition/
+        (["NVIDIA RTX PRO 6000 Blackwell Server Edition"], 120e12),
         # NVIDIA Hopper
         (["h200", "nvl"], 836e12),
         (["h200", "pcie"], 836e12),
