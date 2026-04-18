@@ -133,13 +133,276 @@ At **matched wall-clock** (which is what actually matters for "should I keep thi
 
 **This is a stronger negative result than Karpathy's Feb 2026 writeup.** He reported ~46% → ~35% MFU at d18 with `torch._grouped_mm`; we're seeing ~39% → ~24% at d12 with a simpler scatter-based dispatch. Our dispatch path is more overhead-heavy than his — which was foreseeable (scatter_add is memory-bound; `grouped_mm` is dense-compute-bound). Either way the verdict rhymes: at nanochat scale, routing overhead eats the capacity win.
 
-### Runs 3–6 — E ∈ {2, 8, 16, 32} d12 @ 1500 iters (planned)
+### Run 3 — E=2 d12 @ 1500 iters (re-run for apples-to-apples) (2026-04-18)
 
-- **E=2 @ 1500 iters**: re-run for apples-to-apples with the other MoE configs.
-- **E=8/16/32**: sweep increasing total capacity at fixed active compute.
-- Expected trend (capacity argument): lower val_bpb as E grows.
-- Expected counter (routing overhead): MFU decreasing as E grows, possibly steeply for E=16+.
-- Interesting breakeven question: is the marginal val_bpb gain per extra expert > marginal MFU cost, **at each point on the E axis**?
+| Metric | Value |
+|---|---|
+| Iterations | 1500 |
+| Training wall-clock | 4.33 min |
+| Peak VRAM | 35.1 GiB |
+| Final val_bpb | **0.8773** (↑ vs dense 0.8749, ↑ vs E=4 0.8713) |
+| Final CORE metric | **0.1269** (↓ vs dense 0.1429, ↓ vs E=4 0.1403) |
+| Training MFU (median) | 29.08% |
+
+**E=2 is strictly worse than dense on every axis.** The cause is trivially obvious in hindsight: `num_experts=2, top_k=2` means *all* experts activate for every token, so there is zero routing sparsity. We've replaced one `(D, 4D)` matmul with three smaller matmuls (2 routed each at `D → 4D/3` hidden, + 1 shared at `D → 4D/3` hidden) plus a useless router and an aux-loss pass. Fragmented GEMMs under-utilize tensor cores; no capacity benefit because `top_k == num_experts`. Don't run this config again.
+
+This is a methodology lesson: **the minimum meaningful MoE config has `num_experts > top_k`**. E=2 is a test of the routing-overhead tax at zero sparsity benefit; it should always lose to dense and it does.
+
+### Run 4+ — E ∈ {8, 16, 32, 64, 128} d12 @ 1500 iters (in progress)
+
+Sweep extended to E=128 to force the asymptotic behavior to declare itself — at E=32 and below we may still be in the "capacity isn't enough to matter" regime, where total routed params (≈500M at E=32) aren't yet a significant fraction of what d12 can usefully absorb.
+
+- **E=8**: 2-of-8 routing; paper's recommended small-compute config. 4× total capacity over active.
+- **E=16**: 2-of-16. Per-expert tokens: ~8k per rank — still plenty for tensor cores.
+- **E=32**: 2-of-32. Per-expert tokens: ~5k per rank — may start to hit GEMM efficiency floor.
+- **E=64**: 2-of-64. Per-expert tokens: ~2.5k per rank — routed expert weights ≈1.2B params.
+- **E=128**: 2-of-128. Per-expert tokens: ~1.3k per rank — *small* matmuls, likely worst-case throughput. Routed expert weights ≈2.4B params (still fits in 80GB H100 with bf16 compute + fp32 master, by maybe 2×).
+
+Expected trend if MoE works at all: val_bpb drops as E grows, because total capacity grows (64× routed params at E=128 vs E=2). Expected counter-trend: MFU decreases as E grows — small per-expert matmuls are inefficient, and dispatch overhead scales with E. The breakeven is whether the marginal val_bpb gain per extra expert ever exceeds the marginal MFU cost.
+
+At E=128 the dispatch buffer `(E, cap, D) = (128, 1280, 768)` is only 126M bf16 elements (250 MB) per forward — comfortable. The risk is that tensor cores idle on the (E=128 batched) 1280×768 BMMs — Hopper wants matmuls with at least one dim ≥ 1024 ideally.
+
+## Ideas/extremes still to try (to force MoE to beat dense, or confirm it can't at d12)
+
+The linear `num_experts` sweep above only varies one axis. To force a winning config to declare itself (or rule the whole space out), we need to explore multiple axes. **Break-even math**: at dense MFU=39% and MoE-E=4 MFU=24%, MoE must be ~1.63× better per-step to break even on wall-clock. At E=8 (if MFU drops further) the bar is higher still. Ideas that plausibly close that gap:
+
+### Axis A — cheaper routing (Switch Transformer style)
+
+- [ ] **Top-1 routing, E=8**: half the dispatch/gather work vs top-2. Switch Transformer showed top-1 + slightly larger expert often wins on throughput-to-accuracy.
+- [ ] **Top-1 routing, E=32**: at high E, top-1 keeps per-token compute very sparse. If MFU recovers, this is the most promising "Switch at d12" config.
+- [ ] **Top-1 routing, E=128**: extreme sparsity; per-token active compute is exactly 1 expert's FFN + shared.
+
+With `top_k=1` the default compute-matched sizing gives `expert_hidden = 4·n_embd / (1 + 1) = 2·n_embd = 1536`, so each expert is larger (bigger, better-utilized matmul) — addresses the "small GEMM" problem.
+
+### Axis B — capacity factor tuning
+
+- [ ] **Capacity factor = 1.0 (no slack)** with top-2: reduces dispatch buffer size, improves memory BW. Some tokens drop (the overflow), which may hurt loss slightly — test whether the throughput win offsets that.
+- [ ] **Asymmetric cf**: 1.0 forward, 1.25 train (user's suggestion; requires the train/eval graph split).
+
+### Axis C — number of shared experts
+
+- [ ] **No shared experts** (Switch-pure, `num_shared_experts=0`): removes a dense-like always-on pathway. Should lose, but tests the specific contribution of the shared path.
+- [ ] **2 shared experts**: more always-on dense compute; may help stability at cost of sparsity.
+
+### Axis D — granularity (DeepSeek's axis)
+
+- [ ] **Fine-grained experts**: `num_experts=64 top_k=8 expert_hidden=512`. Same active compute, but each expert is half the size — specialization may emerge better.
+- [ ] **Coarse experts**: `num_experts=4 top_k=2 expert_hidden=2048` — opposite of fine-grained, sanity check.
+
+### Axis E — bigger MoE vs smaller dense (the real matched-compute test)
+
+- [ ] **MoE d12 vs dense d10 @ matched wall-clock**: the nanochat miniseries question. A smaller dense at matched wall-clock might still beat MoE d12. That's the real verdict.
+- [ ] **MoE d14 vs dense d12 @ matched FLOPs**: does MoE allow *going deeper* for same compute?
+
+### Axis F — longer training
+
+- [ ] MoE at 3000 iters: does more training give MoE more time to exploit its extra capacity? If per-step gains compound, the wall-clock penalty may eventually flip.
+
+**Running priority** (after the linear sweep completes): Axis A top-1 variants first (highest expected MFU recovery), then Axis E matched-wall-clock dense-d10 comparison (the actual miniseries question), then the others as budget allows.
+
+### Run 5 — E=8 d12 top_k=2 @ 1500 iters (2026-04-18)
+
+| Metric | Value |
+|---|---|
+| `num_experts` / `top_k` / `num_shared_experts` | 8 / 2 / 1 |
+| Iterations | 1500 |
+| Training wall-clock | **6.03 min** (**+90% vs dense**) |
+| Peak VRAM | 36.6 GiB |
+| Final val_bpb | **0.8659** (↓ vs dense 0.8749 — MoE wins by 9 mbit, 1%) |
+| Final CORE metric | **0.1275** (↓ vs dense 0.1429 — MoE LOSES by 15 mbit, ~11% relative!) |
+| Training MFU (steady-state) | ~24% |
+
+**This is the headline finding of the MoE sweep so far and deserves careful stating:**
+
+**MoE E=8 beats dense d12 on validation loss** (0.866 < 0.875) **but loses decisively on CORE** (0.128 < 0.143). These two metrics disagree. The model is getting *better at the training distribution's next-token prediction* while getting *worse on held-out downstream tasks*.
+
+Possible mechanisms (to distinguish with more experiments):
+1. **Overfitting to the training distribution**: extra capacity lets the MoE memorize FineWeb/ClimbMix patterns that don't transfer to zero-shot tasks.
+2. **Representation fragmentation**: specialized experts develop narrow representations; harder to compose on out-of-distribution prompts.
+3. **CORE noise at d12**: Karpathy's Jan 11 note flagged d12-scale CORE variance; 15 mbit difference *might* be within that envelope, but the direction being consistently against MoE (at E=2, E=4, E=8) is more than noise.
+
+Wall-clock verdict is unambiguous: **~2× slower than dense for a worse downstream metric**. MoE at top_k=2 loses on every axis except val_bpb at this scale.
+
+### Router-to-AdamW fix (before next run)
+
+During the sweep, user pointed out that our implementation put the `router_weight` into Muon via `self.transformer.h.parameters()`. That's wrong — Muon orthogonalizes matrices, which actively fights the router's job of concentrating mass on a few chosen experts per token. AdamW is the right optimizer for routers (Shazeer/DeepSeek convention).
+
+Fix (commit `8001c63` on `moe-experiments`): `setup_optimizer` now excludes `block.mlp.router_weight` from `matrix_params` before Muon grouping, and adds a dedicated AdamW group for router params. Experts (w_fc, w_proj, shared variants) stay on Muon as intended.
+
+All runs *after* this commit use the fix. Runs 0–5 above used the buggy router-on-Muon config; the CORE regression could partially be an artifact of that. **All subsequent runs carry the fix and should be the trusted comparison.**
+
+### Run 6 — E=32 top_k=1 d12 @ 1500 iters (in flight, **router-AdamW fix active**)
+
+Switch-Transformer-style config: 32 experts, 1-of-32 routing, 1 shared expert.
+- `expert_hidden` auto = `4 × 768 / (1 + 1) = 1536` (50% larger than top_k=2 variants — bigger GEMM, better tensor-core utilization).
+- Dispatch/gather work halves vs top_k=2.
+- Total routed capacity: 32 experts × 1536 hidden ≈ 6× E=8 top_k=2 total FFN params.
+
+Hypothesis: the combination of (a) router on AdamW, (b) single-expert dispatch, (c) larger per-expert matmul is the most likely configuration to recover MFU toward dense levels. If MFU gets to ~32–35% AND per-step loss improvement holds, this might finally beat dense on wall-clock.
+
+### Run 6 results
+
+| Metric | Value |
+|---|---|
+| `num_experts` / `top_k` / `num_shared_experts` | 32 / 1 / 1 |
+| `expert_hidden_dim` | 1536 (auto: `4·768/(1+1)`) |
+| Iterations | 1500 |
+| Training wall-clock | **4.95 min** (+56% vs dense) |
+| Peak VRAM | **43.2 GiB** (+54% vs dense) |
+| Final val_bpb | **0.8572** ← best of any MoE config so far, **−18 mbit vs dense (−2.1%)** |
+| Final CORE metric | **0.1408** (−0.002 vs dense; CORE-noise-range) |
+| Training MFU (median / mean) | 26.0% / 25.4% |
+
+**Router-AdamW fix + top_k=1 massively closed the CORE gap** (E=8 k=2 had CORE=0.128, E=32 k=1 has CORE=0.141). Val_bpb and CORE are now both competitive with dense — but wall-clock is still +56% worse.
+
+At matched wall-clock, dense d12 would have done ~2320 iters in E=32 k=1's 4.95 min. Extrapolating the dense val_bpb curve (rate of improvement ≈ 0.04 bpb per 500 iters in the last third of the run), dense at ~2320 iters would reach roughly val_bpb ~0.85, matching MoE. So this is close to a dead heat at matched wall-clock — but still not a clear MoE win.
+
+**The router-AdamW fix alone likely explains a big chunk of the CORE recovery**; we should not over-credit top_k=1 for this. Ideally we'd re-run E=8 k=2 *with* the fix to isolate the top_k effect from the router-optimizer effect.
+
+### Run 7 — E=128 top_k=1 d12 @ 1500 iters (in flight, Kimi-scale)
+
+Kimi K2 uses 384 experts with 8 active. We can't match that at d12 (not enough tokens per expert for 384), but E=128 k=1 pushes our sparsity dial nearly as far.
+- Routed expert weights: 128 × 2 × 768 × 1536 × 12 = 3.6B params (bf16=7.2GB, fp32 master=14.4GB).
+- Dispatch buffer: capacity ≈ 1.25 × 1 × 65536 / 128 = 640 tokens/expert; buffer `(128, 640, 768)` = 63M bf16 = 126MB.
+- Per-expert matmul: 640 × 768 × 1536 bmm — small in M but big in K/N; should keep tensor cores busy.
+- Expected: continued val_bpb improvement (more total capacity), expected MFU drop (more dispatch work).
+
+*Result TBD — first attempt OOM'd (details below).*
+
+### OOM note (Run 7 first attempt)
+
+E=128 k=1 with the default `device_batch_size=32` OOMs on 80GB H100s. Memory breakdown at this scale:
+- Expert master params (fp32): 128 × 2 × 768 × 1536 × 12 × 4 bytes = **14.5 GB**
+- Muon momentum buffers (same size): **14.5 GB**
+- Second-momentum (factored, small): ~60 MB
+- bf16 forward copy of expert weights: 7.2 GB
+- Optimizer gradient staging (fp32): ~14 GB
+- Per-rank activations at `device_batch=32`, `seqlen=2048`: several GB
+
+Total ≈ 72 GB per rank, which is over budget when combined with torch + NCCL overheads.
+
+Retry with `device_batch_size=16` (grad_accum_steps=2) to halve activation memory — **also OOM'd**. The issue is optimizer state, not activations: even sharded Muon momentum + fp32 master + bf16 copy + grads is too much at E=128. User feedback (Apr 2026) pushed back on changing `device_batch_size` anyway — keeping batch constant across the sweep avoids confounding with batch-size effects. Cancelling the E=128 point.
+
+### Run 8 — E=64 top_k=1 d12 @ 1500 iters (router-AdamW fix) (2026-04-18)
+
+| Metric | Value |
+|---|---|
+| `num_experts` / `top_k` / `num_shared_experts` | 64 / 1 / 1 |
+| Iterations | 1500 |
+| Final val_bpb | **0.8626** (worse than E=32 k=1's 0.8572) |
+| Final CORE metric | **0.1230** (worse than E=32 k=1's 0.1408 and dense's 0.1429) |
+
+**E=64 regresses from E=32.** Per-expert tokens drop to ~1k/rank, and CORE drops by 18 mbit. This is the shape of a capacity-vs-fragmentation tradeoff: beyond the E=32 sweet spot, adding experts hurts. This matches Karpathy's intuition that at small scale, too-many-experts means each expert gets too few tokens to learn a useful specialization, and routing gets harder to train.
+
+(Note: E=64 k=1 failed its final `torch.save` because the PVC filled up with accumulated checkpoints from prior runs. The val_bpb + CORE metrics were emitted before the save attempt so we have the numbers. Added `rm -rf $BASE_CKPT_DIR/$WANDB_RUN` at the end of EXPERIMENT_MODE in `nanochat-gio.sh` so future runs don't bloat the PVC.)
+
+### Summary table after linear sweep
+
+| Config | val_bpb | CORE | MFU | wall-clock | peak VRAM | Notes |
+|---|---:|---:|---:|---:|---:|---|
+| **dense d12** | 0.8749 | **0.1429** | **39.3%** | **3.18 min** | **28.0 GiB** | baseline |
+| E=2 k=2 (pre-fix) | 0.8773 | 0.1269 | 29.1% | 4.33 min | 35.1 | degenerate: top_k==E |
+| E=4 k=2 (pre-fix) | 0.8713 | 0.1403 | 23.9% | 4.86 min | 35.6 | tie bpb, lose CORE |
+| E=8 k=2 (pre-fix) | 0.8659 | 0.1275 | ~24% | 6.03 min | 36.6 | win bpb, big CORE regression |
+| **E=32 k=1 (post-fix)** | **0.8572** | 0.1408 | 26.0% | 4.95 min | 43.2 | best bpb, CORE ~ ties dense |
+| E=64 k=1 (post-fix) | 0.8626 | 0.1230 | ? | ? | ? | regresses from E=32 |
+| E=128 k=1 (post-fix) | — | — | — | — | — | OOM (3D expert params > VRAM budget) |
+
+### Takeaway from the linear sweep
+
+At d12, the best MoE config we've found (E=32 top_k=1, with router on AdamW) is **~2% better val_bpb than dense** but **ties dense on CORE** and **still ~56% slower wall-clock**. Dense at matched wall-clock would run ~2300 iters and likely match-or-beat MoE on both metrics.
+
+**This is a stronger corroboration of Karpathy's Feb 2026 verdict**: MoE is not winning wall-clock at nanochat d12 scale with the PyTorch-primitive implementations available to us. The ceiling on MoE's per-step improvement isn't high enough to overcome the ~35% MFU deficit.
+
+### Run 9 — E=8 top_k=1 `expert_hidden_dim=4096` (2026-04-18) — **first config to beat dense on both val_bpb AND CORE**
+
+| Metric | Value | vs dense |
+|---|---|---|
+| `num_experts` / `top_k` / `num_shared_experts` | 8 / 1 / 1 | — |
+| `expert_hidden_dim` | **4096** (2.67× the auto 1536) | — |
+| `active_total` | 380,707,298 (+33% vs dense's 286M) | +33% |
+| Training wall-clock | 6.31 min | **+98%** |
+| Final val_bpb | **0.8458** | **−0.029 (−3.3%)** |
+| Final CORE metric | **0.1455** | **+0.0026** (first MoE win!) |
+| Training MFU | **35.2%** | −10% relative |
+| Total training FLOPs | 1.04e18 | — |
+| aux_loss (final) | 0.120 | — |
+
+**This is the breakthrough so far.** Making each expert bigger (2.67× the compute-matched default):
+1. **Recovered MFU dramatically** — from 26% (compute-matched E=32 k=1) to 35%. Bigger per-expert matmuls use tensor cores much better.
+2. **Kept the val_bpb lead** — in fact extended it: 3.3% better than dense vs E=32 k=1's 2.1%.
+3. **Finally won CORE** — 0.1455 vs dense's 0.1429. The first MoE config in this sweep that isn't a CORE regression.
+
+**But wall-clock is still 2× dense.** Breaking compute-matching means per-token active compute is 1.33× dense, so even at matched MFU we'd expect ~1.33× slower. Combined with the still-present 10% MFU gap vs dense, we get ~2×. MoE wins per-step significantly but loses wall-clock significantly.
+
+### Run 10 — dense d12 @ 3000 iters (wall-clock-matched to MoE E=8 h=4096)
+
+This is the most important comparison in the whole report. MoE E=8 k=1 h=4096 was the best MoE config we found — it even won CORE against dense d12 @ 1500 iters. But MoE used 6.31 min of wall-clock. For the miniseries principle to apply, the right comparison is "what does dense do in the same 6.31 min?" — not "what does dense do in 1500 iters?" Dense is faster per step, so it gets more iterations for the same budget.
+
+| Metric | dense d12 @ 3000 iters | MoE E=8 k=1 h=4096 @ 1500 iters | Winner |
+|---|---:|---:|---|
+| Iterations | 3000 | 1500 | — |
+| Training wall-clock | **6.36 min** | 6.31 min | ~matched |
+| Peak VRAM | 28.0 GiB | ~47 GiB (est.) | dense |
+| Final val_bpb | **0.8395** | 0.8458 | **dense −0.006 (−0.75%)** |
+| Final CORE metric | **0.1651** | 0.1455 | **dense +0.020 (+13.5% relative)** |
+
+**At matched wall-clock, dense d12 beats the best MoE config decisively on both val_bpb and CORE.**
+
+The gap isn't marginal: dense's CORE is 13.5% higher. Even though MoE had a 2.1% val_bpb lead at matched iterations (1500 vs 1500), doubling dense's training budget (to get same wall-clock) pushes dense's val_bpb below MoE's and its CORE far above.
+
+---
+
+## Final verdict (post-sweep)
+
+**MoE at nanochat d12 scale does not win.** This is confirmed across:
+
+| Axis swept | Winner at matched wall-clock |
+|---|---|
+| `num_experts` (linear sweep 2 → 64, k=2 then k=1) | dense |
+| `top_k` (2 vs 1) | dense |
+| `expert_hidden_dim` (auto vs 2.7× auto) | dense |
+| Optimizer routing (router on Muon vs AdamW) | dense (fix was necessary but insufficient) |
+
+The negative result **corroborates Karpathy's Feb 2026 writeup** and, importantly, generalizes it:
+
+- Karpathy used `torch._grouped_mm` at d18 and found MoE loses wall-clock. We used a scatter-based dispatch at d12 and also find MoE loses wall-clock — with a worse MFU penalty (~40% relative vs his ~24%), and still coming up short.
+- The single MoE config that beat dense-@-1500-iters on both val_bpb and CORE (E=8 k=1 h=4096) still loses to dense-@-3000-iters, which is what dense reaches in the same wall-clock.
+
+### Why MoE loses at d12
+
+Three compounding problems, in order of magnitude:
+
+1. **Dispatch is memory-bandwidth-bound**, not compute-bound. At ~65K tokens/rank and modest `num_experts`, the per-expert matmul isn't big enough to amortize the sort + scatter + gather. Our scatter_add + BMM path hits 24–35% MFU vs dense's 39%. Karpathy's grouped_mm path hit 35% vs dense's 46%. Either way MoE pays 25–40% relative MFU.
+2. **Compute-matched MoE has no throughput room to out-learn**. When active params match dense, MoE's only edge is the *total* capacity it carries around (which per-token it can't use). The single chosen expert per token contains the same matmul count as dense's MLP, but dense does this with one big matmul while MoE does it with a batched bmm — less efficient. MoE's 2% val_bpb advantage at matched iterations isn't enough to clear the wall-clock gap.
+3. **Pushing past compute-matching costs wall-clock proportionally.** `expert_hidden=4096` gave MoE +33% active params per token and did lift both val_bpb and CORE — but training time also scales up, and dense-given-the-same-wall-clock did more iterations and won anyway.
+
+### Where MoE *would* start to win at d12
+
+Not at d12 as currently shaped, with our implementation, on this hardware. To get a d12 MoE win you'd need some combination of:
+
+- **A fused FlashMoE kernel** (routing + dispatch + expert matmul in one kernel, following the FlashAttention playbook). Would need to be ≥ 80% of dense's MFU. Does not exist yet as a standard PyTorch primitive.
+- **Expert parallelism** (each GPU hosts a subset of experts; use network to route tokens). Collapses the replicated expert weights into GPU-distributed storage; would allow much larger total capacity for the same per-GPU VRAM. Only worth the engineering if the fused kernel also exists.
+- **Much larger model / longer training**. The capacity argument may only start to pay for MoE at ≥ d20 with multi-hour training. Our sweep is decisive for d12 at ~6min wall-clock; we haven't addressed d18–d26 at multi-hour budgets. Karpathy's Feb 2026 run at d18 also said no — so extrapolation to larger scale seems unlikely to flip the verdict, but has not been measured here.
+
+### What to keep from this sweep
+
+- `nanochat/moe.py` is functional and passes smoke tests; it's a reasonable reference for anyone who wants to revisit MoE later. Keep it as documented dead code (or behind a flag) rather than deleting.
+- The `optim.py` generalization to 3D params is independently useful (any future 3D-param construct benefits from this).
+- The active-params DeepSeek-style `num_scaling_params` split is the right scaling-laws accounting even if we don't ship MoE — it's how you'd compare any structured-sparsity technique cleanly.
+- **This report**. If someone comes back and asks "has anyone tried top_k=1 with big experts at d12?", the answer lives here with all the numbers.
+
+### If I had another hour
+
+Things I would test to stress-test the verdict further, ordered by likelihood of changing it:
+
+1. **Dense d12 @ FP8**: nanochat has an `--fp8` flag; our dense baseline was bf16 only. FP8 dense should be faster → dense at matched wall-clock does even more iterations → verdict gets stronger against MoE, not weaker. (MoE can't use FP8 for its 3D expert weights without custom autograd.)
+2. **MoE at d18 or d22**: test whether the verdict extrapolates upward. Expected: MoE still loses, but the gap narrows.
+3. **MoE capacity factor 1.0**: Noam's suggestion; trivial code change, might recover a few percent MFU.
+4. **Sinkhorn routing**: replaces aux-loss with a transport-based balancing scheme. Simpler training dynamics but more compute per step for the routing math.
+5. **Dense-d14 @ 1500 vs MoE-d12 @ 1500** at matched wall-clock: does MoE at d12 beat a *wider* dense at higher depth? This is the real "lift the frontier" test.
+
+None of these are likely to flip the verdict given what we've seen, but they'd harden it.
 
 ## Analysis framework (how we'll answer "did MoE win?")
 
