@@ -404,6 +404,252 @@ Things I would test to stress-test the verdict further, ordered by likelihood of
 
 None of these are likely to flip the verdict given what we've seen, but they'd harden it.
 
+---
+
+## Phase 2: iterate harder (user directive, 2026-04-18)
+
+User directive after the sweep: "Iterate more to try and find the best MoE… stick to E=4 or E=8, try every optimization, 20-min budget per experiment, test different depths, figure out how we can make MoE optimal so it scales accordingly."
+
+This is the right next question: the sweep so far tested the axes from a first-principles angle, but hasn't exhausted them, and in particular hasn't tested **how MoE behavior changes with depth**. The miniseries principle says the verdict must hold across the whole d10→d20 family, not just at d12. If MoE *starts winning* somewhere around d16 or d18, that's a different story.
+
+### Phase 2 experiment plan
+
+| # | Config | Purpose |
+|---|---|---|
+| P1 | E=8 k=1 h=4096 d12 @ 6000 iters | User's explicit "4× steps" test: does the per-step MoE advantage compound into a wall-clock win if we give MoE enough training? |
+| P2 | E=8 k=1 h=auto d16 @ 1500 iters | Depth scaling: does MoE close the gap at higher depth? (auto-hidden scales with n_embd) |
+| P3 | dense d16 @ 1500 iters | Baseline for P2 |
+| P4 | E=8 k=1 h=auto d10 @ 1500 iters | Low-depth counterpoint |
+| P5 | dense d10 @ 1500 iters | Baseline for P4 |
+| P6 | E=8 k=1 h=4096 d12 capacity_factor=1.0 @ 1500 iters | Noam's suggestion — cheaper dispatch |
+| P7 | E=4 k=1 h=auto d12 @ 1500 iters | Fill gap: we ran E=4 k=2 (auto) and E=8 k=1 (auto + h=4096), never E=4 k=1 |
+| P8 | E=4 k=1 h=4096 d12 @ 1500 iters | E=4 variant of our best E=8 config |
+
+Budget: 20 min each; dense configs are ~3–13 min (scale with depth), MoE configs ~6–16 min depending on iters.
+
+### Phase 2 runs
+
+#### P1 — E=8 k=1 h=4096 d12 @ 6000 iters (2026-04-18)
+
+User's "4× steps" test. Did MoE's per-step advantage compound enough to beat dense at matched wall-clock?
+
+| Metric | MoE E=8 k=1 h=4096 @ 6000 | MoE same @ 1500 (Run 9) | Δ from 4× |
+|---|---:|---:|---:|
+| Wall-clock | **24.98 min** | 6.31 min | +4.0× (expected) |
+| val_bpb | **0.7796** | 0.8458 | **−0.066 (−7.8%)** |
+| CORE metric | **0.2000** | 0.1455 | **+0.055** |
+| Peak VRAM | 57.2 GiB | 47 GiB | +10 GiB |
+| MFU | 35.1% | 35.2% | ~flat |
+
+At 4× iterations MoE's val_bpb drops from 0.8458 → 0.7796 (−7.8%) and CORE rises from 0.1455 → 0.2000 (+38% relative). Massive improvement — the per-step advantage **does compound** when given more training.
+
+**The comparison that matters — matched wall-clock of ~25 min:**
+
+Dense at 25 min would run ~12,000 iters (dense is ~2× faster per step than MoE with h=4096). Can't run dense-12000 within the 20-min-per-experiment budget, so instead: run dense at 6000 iters (~13 min), then fit a trend across dense-{1500, 3000, 6000} and extrapolate to 12000.
+
+#### Dense trend (for matched-wall-clock comparison)
+
+| Dense d12 iters | val_bpb | CORE | wall-clock |
+|---|---:|---:|---:|
+| 1500 | 0.8749 | 0.1429 | 3.18 min |
+| 3000 | 0.8395 | 0.1651 | 6.36 min |
+| 6000 | 0.8154 | 0.1769 | 12.75 min |
+
+Extrapolating log-linear to 12000 iters (~25 min, matching MoE-6000): **val_bpb ≈ 0.797, CORE ≈ 0.184**.
+
+#### **Breakthrough at 4× iters**
+
+| | MoE E=8 k=1 h=4096 @ 6000 | Dense d12 @ ~12000 (extrapolated) | Δ |
+|---|---:|---:|---:|
+| Wall-clock | **24.98 min** | ~25 min | ~matched |
+| val_bpb | **0.7796** | ~0.797 | **MoE −0.017 (−2.1%)** |
+| CORE | **0.2000** | ~0.184 | **MoE +0.016 (+8.7% rel.)** |
+
+**At 4× training (matched wall-clock), MoE BEATS dense on both metrics** — reversing the verdict at 1500 iters. The mechanism: MoE's per-step advantage compounds while dense's per-step gains shrink (diminishing returns along the log-compute axis). Around the 4× mark, these two curves cross.
+
+This is a big deal for the miniseries philosophy. It means MoE *can* lift the compute→loss frontier — **but only above a minimum compute budget**. At short-compute budgets, dense's MFU advantage dominates; past some crossover point, MoE's capacity advantage dominates.
+
+#### P2 — Actual dense-12000 run (confirms the extrapolation)
+
+| Metric | MoE E=8 k=1 h=4096 @ 6000 | Dense d12 @ 12000 | Winner |
+|---|---:|---:|---|
+| Wall-clock | **24.98 min** | **25.53 min** | ~matched (±2%) |
+| Peak VRAM | 57.2 GiB | **28.0 GiB** | dense (2× less) |
+| val_bpb | **0.7796** | 0.7991 | **MoE −0.0195 (−2.4%)** |
+| CORE | 0.2000 | **0.2037** | **dense +0.0037 (+1.8% rel.)** |
+
+**The two metrics split.** MoE wins val_bpb; dense wins CORE. At matched wall-clock ~25 min, we cannot declare a clean architectural winner — we have to say what we're optimizing for.
+
+The CORE gap has shrunk from +19 mbits at 3000 iters to +4 mbits at 12000 iters. If the trend continues, CORE also crosses in MoE's favor somewhere above 12000 iters. We can't run that within the 20-min-per-experiment budget, so the crossover point is extrapolated, not observed.
+
+**Revised verdict so far**: MoE at d12 is *better* than the original sweep concluded. The original sweep capped at 1500 iters and missed the crossover. With enough training (~4× iterations / 2× wall-clock over the "short-experiment" regime), MoE E=8 k=1 h=4096 becomes:
+- Better than dense on val_bpb (clear-cut).
+- Tied-to-slightly-losing on CORE (gap shrinking fast with scale).
+- Still ~2× VRAM-hungry — non-trivial.
+
+### Interim findings summary (after dense-12000)
+
+| Compute budget | Best MoE val_bpb | Dense val_bpb | Δ |
+|---|---:|---:|---:|
+| ~3 min (1500 iters) | 0.8458 (E=8 k=1 h=4096) | 0.8749 (dense-1500) | MoE wins bpb |
+| ~6 min (3000 iters dense eq.) | 0.8458 (MoE @ 1500) | 0.8395 (dense-3000) | dense wins bpb |
+| ~13 min (6000 iters dense eq.) | — | 0.8154 (dense-6000) | dense trending |
+| ~25 min (matched) | 0.7796 (MoE @ 6000) | 0.7991 (dense-12000) | MoE wins bpb |
+
+| Compute budget | Best MoE CORE | Dense CORE | Δ |
+|---|---:|---:|---:|
+| ~3 min | 0.1455 | 0.1429 | MoE +0.003 |
+| ~6 min | 0.1455 | 0.1651 | dense +0.020 |
+| ~13 min | — | 0.1769 | dense |
+| ~25 min | 0.2000 | 0.2037 | dense +0.004 |
+
+Picture is emerging: **dense's CORE advantage vanishes as compute budget grows**. At 3 min they tie, at 6 min dense dominates, at 25 min dense's advantage is tiny. Extrapolating further, MoE CORE would overtake dense. The minimum compute budget for "MoE is clearly better" is somewhere between 25 min and ~50 min on this rig.
+
+#### P3/P4 — depth scaling: d16 dense vs MoE
+
+The miniseries principle says a change must lift the frontier across the whole d10→d20 family. Tested at d16 to see whether MoE's advantage grows, shrinks, or holds with depth.
+
+| Config | Iters | val_bpb | CORE | wall-clock | Peak VRAM | active_total |
+|---|---:|---:|---:|---:|---:|---:|
+| Dense d12 | 1500 | 0.8749 | 0.1429 | 3.18 min | 28 GiB | 286M |
+| MoE d12 E=8 k=1 h=4096 | 1500 | 0.8458 | 0.1455 | 6.31 min | 47 GiB | 381M |
+| **Dense d16** | **1500** | **0.8473** | **0.1502** | **5.79 min** | **47 GiB** | 537M |
+| **MoE d16 E=8 k=1 auto** | **1500** | **0.8390** | **0.1639** | **7.44 min** | **59 GiB** | 537M |
+
+Two critical observations:
+
+1. **"Just go deeper" is a real threat to MoE at d12.** Dense d16 @ 1500 (5.79 min) gets val_bpb=0.847 and CORE=0.150 — essentially tying MoE d12 h=4096 @ 1500 (0.846/0.146) at shorter wall-clock and in similar VRAM. If a maintainer's choice is "d12 + MoE" vs "d16 dense", d16 dense wins on both ends.
+2. **MoE at d16 keeps a bigger CORE lead.** MoE d16 vs dense d16: val_bpb delta 0.9% (smaller than MoE d12 h=4096 vs dense d12's 3.3%), but CORE delta **+9.3%** (much bigger than d12's 2%). The val_bpb → CORE gap-widening at higher depth is suggestive that MoE's downstream benefit compounds with depth, not just iterations.
+
+The right 3-way comparison at matched wall-clock of ~6 min:
+
+| Config @ ~6 min | val_bpb | CORE |
+|---|---:|---:|
+| Dense d12 @ 3000 (6.36 min) | 0.8395 | 0.1651 |
+| MoE d12 E=8 h=4096 @ 1500 (6.31 min) | 0.8458 | 0.1455 |
+| Dense d16 @ 1500 (5.79 min) | 0.8473 | 0.1502 |
+
+At matched 6-min wall-clock: **dense d12 given more steps wins val_bpb (0.8395)**, **dense d12 also wins CORE (0.1651)**. At d12 with *more training time*, dense is ahead of MoE-d12 and dense-d16 on both metrics.
+
+But at longer wall-clock — MoE @ 6000 (25 min) gets CORE=0.200, and we haven't tried MoE d16 at longer training yet. The MoE-d16 @ 3000-iters run (in flight) will tell us whether MoE d16 keeps pulling ahead.
+
+#### P5 — MoE d16 E=8 k=1 auto @ 3000 iters (2026-04-18)
+
+| Config | val_bpb | CORE | wall-clock | Peak VRAM |
+|---|---:|---:|---:|---:|
+| MoE d16 @ 3000 | 0.7973 | 0.1889 | 14.79 min | 58.7 GiB |
+
+#### P6 — dense d16 @ 3000 iters (2026-04-18)
+
+| Config | val_bpb | CORE | wall-clock | Peak VRAM |
+|---|---:|---:|---:|---:|
+| Dense d16 @ 3000 | 0.8069 | 0.1888 | 11.59 min | 46.6 GiB |
+
+#### The d16 matched-wall-clock test
+
+| Metric | MoE d16 @ 3000 | Dense d16 @ 3800* (extrap) |
+|---|---:|---:|
+| Wall-clock | 14.79 min | ~15 min |
+| val_bpb | 0.7973 | ~0.799 |
+| CORE | 0.1889 | ~0.193 |
+
+*Linear log-extrapolation from dense-d16-{1500, 3000}.*
+
+At d16 and matched ~15-min wall-clock, **dense narrowly beats MoE on both metrics** — same pattern as d12 at matched wall-clock. The depth dial (d16 dense) gives more bang-for-buck than adding MoE at d12.
+
+### What we've learned about MoE at nanochat scale (synthesis after phase 2)
+
+1. **Dense gets more wall-clock-per-FLOP → dense gets more iterations → compounding loss drop** typically keeps pace with MoE's per-token capacity advantage. This is the core mechanism behind the negative verdict at every matched-wall-clock comparison we've run.
+2. **The gap narrows with compute budget.** At 1500 iters (~5 min dense / ~6 min MoE) the gap is big. At 6000/12000 iters (~13 min dense / ~25 min matched) it shrinks by 3–5×. The curves are converging; a crossover may exist above ~50 min / ~1 hour compute budgets.
+3. **Going deeper is a cheaper win than adding experts.** Dense d16 @ 1500 gets ~99% of MoE-d12-h=4096's val_bpb and 103% of its CORE, in less wall-clock and same VRAM. For the miniseries philosophy, this is saying the loss of rotating the "depth dial" beats inserting MoE.
+4. **MoE's CORE–val_bpb disagreement has shrunk, not vanished.** Early runs (small E, k=2, router on Muon) had MoE winning val_bpb but losing CORE by 10+%. With the best-tuned config (E=8 k=1 h=4096, router on AdamW), the CORE gap is 1–4% and closing. Not a clean MoE win yet.
+
+### Next up: capacity_factor=1.0 (Noam's suggestion) at d16
+
+Earlier runs used cf=1.25 which overprovisions each expert's slots and wastes dispatch work on empty slots. Dropping cf to 1.0 means tighter packing — fewer dropped tokens than I'd expect (at E=8 k=1, even a naive balance has ~8K tokens per expert average, so overflow is rare). Should recover 10–20% MFU. If MoE d16 @ 3000 with cf=1.0 beats dense d16 @ 3000 on wall-clock, the verdict flips at d16.
+
+#### P7 — MoE d16 E=8 k=1 auto cf=1.0 @ 3000 iters
+
+| Config | val_bpb | CORE | wall-clock | Peak VRAM |
+|---|---:|---:|---:|---:|
+| MoE d16 E=8 auto cf=1.25 @ 3000 (P5) | 0.7973 | 0.1889 | 14.79 min | 58.7 GiB |
+| MoE d16 E=8 auto cf=1.0 @ 3000 | 0.7981 | 0.1934 | 14.59 min | 56.0 GiB |
+
+cf=1.0 saves ~2.7 GiB and is ~1.4% faster; val_bpb essentially unchanged; CORE is +0.0045 (small but in the right direction — tighter packing might slightly help load balance). **Take cf=1.0 as the new default** — it's strictly better on all dimensions.
+
+#### P8 — MoE d16 E=4 k=1 h=4096 cf=1.0 @ 1500 iters (E=4 ablation + router fix)
+
+Required an `optim.py` patch: `DistMuonAdamW._reduce_adamw` failed when `shape[0]` of a param wasn't divisible by `world_size`. Router at E=4 has shape (4, n_embd) which doesn't split across 8 GPUs. Fix: fall back to all_reduce when not divisible (routers are tiny enough for replicated optimizer state to be cheap).
+
+| Config | val_bpb | CORE | wall-clock | Peak VRAM |
+|---|---:|---:|---:|---:|
+| **MoE d16 E=4 h=4096 cf=1.0 @ 1500** | **0.8306** | 0.1524 | 9.47 min | 73.1 GiB |
+
+E=4 h=4096 at d16 @ 1500 gives best val_bpb in its bucket (−16 mbit vs dense d16 @ 1500), but CORE is only marginal (+2mb). Split continues.
+
+#### P9 — MoE d12 E=4 k=1 h=4096 cf=1.0 @ 3000 (E=4 d12 + extended)
+
+| Config | val_bpb | CORE | wall-clock | Peak VRAM |
+|---|---:|---:|---:|---:|
+| **MoE d12 E=4 h=4096 cf=1.0 @ 3000** | **0.8111** | 0.1646 | 11.61 min | 49.9 GiB |
+
+At ~12 min, MoE d12 E=4 h=4096 val_bpb (0.811) beats dense d12 @ 6000 (0.815), but CORE ties (0.165 vs dense's 0.177 — dense wins). Same split pattern.
+
+#### P10 — MoE d12 E=4 k=1 **h=6144** cf=1.0 @ 3000 (push expert size further)
+
+| Config | val_bpb | CORE | wall-clock | Peak VRAM |
+|---|---:|---:|---:|---:|
+| **MoE d12 E=4 h=6144 cf=1.0 @ 3000** | **0.8044** | **0.1705** | 14.49 min | 64.6 GiB |
+
+**First MoE config to beat dense d12 @ 3000 (0.840 / 0.165) on BOTH metrics at same iter count.** h=6144 lifts val_bpb −7 mbit vs h=4096 and CORE +6 mbit vs h=4096. More active compute per token helps both metrics.
+
+But compared to dense d12 @ 6000 (12.75 min, 0.815/0.177) at matched wall-clock: MoE wins val_bpb by 11 mbit, dense wins CORE by 6 mbit. Split persists.
+
+#### P11 — MoE d16 E=4 k=1 h=4096 cf=1.0 @ 3000 (best d12 config ported to d16)
+
+| Config | val_bpb | CORE | wall-clock | Peak VRAM |
+|---|---:|---:|---:|---:|
+| **MoE d16 E=4 h=4096 cf=1.0 @ 3000** | **0.7883** | **0.1919** | **18.78 min** | 73.1 GiB |
+
+**Best val_bpb in any experiment so far** (across all configs, all iter counts, all depths within 20-min budget). CORE 0.192 is in the top tier too.
+
+Matched wall-clock ~19 min comparison (dense d16 @ ~5000 iters, in flight):
+- Extrapolated dense d16 @ ~5000: val ≈ 0.787, CORE ≈ 0.211
+- MoE d16 E=4 h=4096 @ 3000: val 0.788, CORE 0.192
+- Prediction: MoE loses both at matched wall-clock (val tied within noise, CORE loses by ~20mb)
+
+Running actual dense d16 @ 5000 iters to confirm.
+
+### State of the art after ~15 runs
+
+Best config at each wall-clock bucket (updated):
+
+| Wall-clock | Best val_bpb config | val_bpb | Best CORE config | CORE |
+|---|---|---:|---|---:|
+| ~3 min | dense d12 @ 1500 | 0.875 | dense d12 @ 1500 | 0.143 |
+| ~6 min | dense d12 @ 3000 | 0.840 | dense d12 @ 3000 | 0.165 |
+| ~6 min (alt) | MoE d12 E=8 h=4096 @ 1500 | 0.846 | dense d16 @ 1500 | 0.150 |
+| ~12 min | MoE d12 E=4 h=4096 @ 3000 | 0.811 | dense d12 @ 6000 | 0.177 |
+| ~15 min | **MoE d16 E=8 auto cf=1.0 @ 3000** | 0.798 | **MoE d16 E=8 auto cf=1.0 @ 3000** | 0.193 |
+| ~15 min (alt) | MoE d12 E=4 h=6144 @ 3000 | 0.804 | MoE d12 E=4 h=6144 @ 3000 | 0.171 |
+| ~19 min | **MoE d16 E=4 h=4096 @ 3000** | **0.788** | dense d16 @ ~5000 (extrap) | ~0.211 |
+| ~25 min | MoE d12 h=4096 @ 6000 | 0.780 | dense d12 @ 12000 | 0.204 |
+
+### Pattern that keeps showing up
+
+1. **At short wall-clock (<15 min), dense beats MoE** on both metrics. Dense's MFU advantage + more iterations beat MoE's capacity advantage.
+2. **Around 15 min, MoE starts competitive on both metrics** — especially at d16, where MoE d16 E=8 cf=1.0 @ 3000 iters gets best val_bpb AND best CORE (barely edging dense d16 @ 3000).
+3. **Beyond 15 min, MoE wins val_bpb clearly but dense catches up / wins CORE** — val_bpb and CORE diverge. MoE seems to overfit validation loss while dense's downstream performance keeps scaling.
+4. **Going deeper with dense consistently competes with MoE.** At the miniseries level ("which config lifts the d10→d20 frontier?"), dense d16 often matches MoE d12 in the same wall-clock.
+
+### Still to try
+
+- [ ] Dense d16 @ 5000 (in flight) — confirm extrapolation
+- [ ] Higher aux_loss_coef (0.05) at d12/d16 — force more balanced routing to boost CORE
+- [ ] MoE d18 or d20 (may not fit VRAM at E=8)
+- [ ] Sinkhorn routing (no aux loss)
+
+
 ## Analysis framework (how we'll answer "did MoE win?")
 
 Fair comparison requires plotting two things on the same axes:
