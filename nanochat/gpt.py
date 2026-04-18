@@ -44,6 +44,7 @@ class GPTConfig:
     num_shared_experts: int = 0
     capacity_factor: float = 1.25
     moe_aux_loss_coef: float = 0.01
+    expert_hidden_dim: int = -1  # -1 = auto (compute-matched to dense active FFN)
 
 
 def norm(x):

@@ -46,9 +46,14 @@ class MoE(nn.Module):
         self.num_shared_experts = config.num_shared_experts
         self.capacity_factor = config.capacity_factor
         self.aux_loss_coef = config.moe_aux_loss_coef
-        self.expert_hidden_dim = default_expert_hidden(
-            config.n_embd, self.top_k, self.num_shared_experts
-        )
+        # Explicit override > auto compute-matched sizing.
+        explicit = getattr(config, "expert_hidden_dim", -1)
+        if explicit is not None and explicit > 0:
+            self.expert_hidden_dim = explicit
+        else:
+            self.expert_hidden_dim = default_expert_hidden(
+                config.n_embd, self.top_k, self.num_shared_experts
+            )
 
         # Router: project n_embd -> num_experts. Shape (num_experts, n_embd) so it groups
         # with other 2D matrix params of like shape across layers in Muon.
