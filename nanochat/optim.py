@@ -385,13 +385,16 @@ class DistMuonAdamW(torch.optim.Optimizer):
         param_infos = {}
         for p in group['params']:
             grad = p.grad
-            if p.numel() < 1024:
-                # Small params: all_reduce (no scatter/gather needed)
+            # Use the reduce_scatter (ZeRO) path only when the param is large AND its first dim
+            # splits evenly across ranks. Otherwise fall back to all_reduce (replicated optimizer
+            # state). This is what lets MoE routers with num_experts not divisible by world_size
+            # still work — they're tiny enough that the full-replicate cost is negligible.
+            if p.numel() < 1024 or grad.shape[0] % world_size != 0:
+                # Small-or-indivisible params: all_reduce (no scatter/gather needed)
                 future = dist.all_reduce(grad, op=dist.ReduceOp.AVG, async_op=True).get_future()
                 param_infos[p] = dict(future=future, grad_slice=grad, is_small=True)
             else:
-                # Large params: reduce_scatter
-                assert grad.shape[0] % world_size == 0, f"AdamW reduce_scatter requires shape[0] ({grad.shape[0]}) divisible by world_size ({world_size})"
+                # Large params with divisible shape[0]: reduce_scatter
                 rank_size = grad.shape[0] // world_size
                 grad_slice = torch.empty_like(grad[:rank_size])
                 future = dist.reduce_scatter_tensor(grad_slice, grad, op=dist.ReduceOp.AVG, async_op=True).get_future()
