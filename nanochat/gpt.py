@@ -418,13 +418,21 @@ class GPT(nn.Module):
 
         # Separate out all parameters into groups
         matrix_params = list(self.transformer.h.parameters())
+        # MoE router weights want AdamW (flexible triage), not Muon (which orthogonalizes).
+        # Pull them out of matrix_params before Muon grouping.
+        router_params = []
+        if self.config.num_experts > 1:
+            for block in self.transformer.h:
+                router_params.append(block.mlp.router_weight)
+            router_ids = {id(p) for p in router_params}
+            matrix_params = [p for p in matrix_params if id(p) not in router_ids]
         value_embeds_params = list(self.value_embeds.parameters())
         embedding_params = list(self.transformer.wte.parameters())
         lm_head_params = list(self.lm_head.parameters())
         resid_params = [self.resid_lambdas]
         x0_params = [self.x0_lambdas]
         smear_params = [self.smear_gate.weight, self.smear_lambda, self.backout_lambda]
-        assert len(list(self.parameters())) == len(matrix_params) + len(embedding_params) + len(lm_head_params) + len(value_embeds_params) + len(resid_params) + len(x0_params) + len(smear_params)
+        assert len(list(self.parameters())) == len(matrix_params) + len(router_params) + len(embedding_params) + len(lm_head_params) + len(value_embeds_params) + len(resid_params) + len(x0_params) + len(smear_params)
 
         # Scale the LR for the AdamW parameters by ∝1/√dmodel (tuned for 768 dim model)
         dmodel_lr_scale = (model_dim / 768) ** -0.5
@@ -440,6 +448,13 @@ class GPT(nn.Module):
             dict(kind='adamw', params=x0_params, lr=scalar_lr, betas=(0.96, 0.95), eps=1e-10, weight_decay=0.0),  # higher beta1 for x0
             dict(kind='adamw', params=smear_params, lr=0.2, betas=(0.8, 0.95), eps=1e-10, weight_decay=0.0),
         ]
+        # MoE router: AdamW, small params across layers. Keep same defaults as the matrix AdamW group below.
+        if router_params:
+            param_groups.append(dict(
+                kind='adamw', params=router_params,
+                lr=matrix_lr * dmodel_lr_scale,
+                betas=(0.8, 0.96), eps=1e-10, weight_decay=0.0,
+            ))
         # Muon groups (matrix params, grouped by shape for stacking)
         for shape in sorted({p.shape for p in matrix_params}):
             group_params = [p for p in matrix_params if p.shape == shape]
