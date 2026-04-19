@@ -341,13 +341,12 @@ class _Float8GroupedBMM(torch.autograd.Function):
 
     @staticmethod
     def forward(ctx, act, weight):
-        # Save bf16 views for backward — cheap and simpler than staying in FP8.
-        ctx.save_for_backward(act, weight)
+        # Save FP8 tensors + scales (half the memory of bf16). Dequantize on demand
+        # in backward. Also save the output dtype so backward produces the right type.
         act_fp8, act_inv = _rowwise_fp8_act(act, torch.float8_e4m3fn)
         w_T_fp8, w_inv = _rowwise_fp8_weight_T(weight, torch.float8_e4m3fn)
-        # _scaled_grouped_mm expects mat2 in "transposed" layout i.e. (E, N, K) row-major;
-        # when viewed through `.transpose(-1, -2)` it appears as (E, K, N) col-major,
-        # which is what the scaled matmul actually wants.
+        ctx.save_for_backward(act_fp8, act_inv, w_T_fp8, w_inv)
+        ctx.out_dtype = act.dtype
         out = torch._scaled_grouped_mm(
             act_fp8, w_T_fp8.transpose(-1, -2),
             act_inv, w_inv,
@@ -358,11 +357,16 @@ class _Float8GroupedBMM(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, grad_output):
-        act, weight = ctx.saved_tensors
-        # grad_input = grad_output @ weight.T   : (E, M, N) @ (E, N, K) -> (E, M, K)
-        grad_input = torch.bmm(grad_output, weight.transpose(-1, -2))
-        # grad_weight = input.T @ grad_output   : (E, K, M) @ (E, M, N) -> (E, K, N)
-        grad_weight = torch.bmm(act.transpose(-1, -2), grad_output)
+        act_fp8, act_inv, w_T_fp8, w_inv = ctx.saved_tensors
+        dt = ctx.out_dtype
+        # Dequantize on the fly. act_fp8 shape (E, M, K); act_inv (E, M).
+        # Note: act_inv is the *inverse* scale, so multiplying recovers original magnitudes.
+        act_bf16 = act_fp8.to(dt) * act_inv.unsqueeze(-1).to(dt)                  # (E, M, K)
+        weight_bf16 = (w_T_fp8.to(dt) * w_inv.unsqueeze(-1).to(dt)).transpose(-1, -2)  # (E, K, N)
+        # grad_input = grad_output @ weight.T : (E, M, N) @ (E, N, K) -> (E, M, K)
+        grad_input = torch.bmm(grad_output, weight_bf16.transpose(-1, -2))
+        # grad_weight = input.T @ grad_output : (E, K, M) @ (E, M, N) -> (E, K, N)
+        grad_weight = torch.bmm(act_bf16.transpose(-1, -2), grad_output)
         return grad_input, grad_weight
 
 
