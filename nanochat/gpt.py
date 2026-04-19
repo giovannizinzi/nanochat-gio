@@ -383,25 +383,38 @@ class GPT(nn.Module):
         (top_k out of num_experts routed experts, plus shared experts).
         Following DeepSeek convention of reporting both total and active params.
         """
-        # Count each group separately (mirrors the grouping in setup_optimizers)
+        # Count each group separately (mirrors the grouping in setup_optimizers).
         wte = sum(p.numel() for p in self.transformer.wte.parameters())
         value_embeds = sum(p.numel() for p in self.value_embeds.parameters())
         lm_head = sum(p.numel() for p in self.lm_head.parameters())
         transformer_matrices = sum(p.numel() for p in self.transformer.h.parameters())
         scalars = self.resid_lambdas.numel() + self.x0_lambdas.numel() + self.smear_gate.weight.numel() + self.smear_lambda.numel() + self.backout_lambda.numel()
-        total = wte + value_embeds + lm_head + transformer_matrices + scalars
-        assert total == sum(p.numel() for p in self.parameters()), "Parameter count mismatch"
-        # MoE: only top_k/num_experts fraction of routed expert params active per token.
-        # Shared experts are always active so their params stay in the active count.
+        # Under Expert Parallel, this rank only holds E/world_size routed experts. The local
+        # transformer_matrices count is therefore missing the (world_size-1)/world_size of
+        # routed experts that live on other ranks. Upgrade to a "global" count so downstream
+        # scaling-law math (active_* etc.) sees the full logical model.
         moe_inactive = 0
+        ep_missing = 0  # routed-expert params held on OTHER ranks under EP
         if self.config.num_experts > 1:
             moe = self.transformer.h[0].mlp
             expert_hidden = moe.expert_hidden_dim
-            routed_params_per_layer = self.config.num_experts * 2 * self.config.n_embd * expert_hidden
-            inactive_per_layer = routed_params_per_layer * (self.config.num_experts - self.config.top_k) // self.config.num_experts
+            per_expert_ffn = 2 * self.config.n_embd * expert_hidden
+            # Global routed-expert params (across all ranks if EP is on)
+            routed_params_per_layer_global = self.config.num_experts * per_expert_ffn
+            # Inactive per token = (num_experts - top_k) fraction of routed params
+            inactive_per_layer = routed_params_per_layer_global - (self.config.top_k * per_expert_ffn)
             moe_inactive = inactive_per_layer * self.config.n_layer
-        active_transformer_matrices = transformer_matrices - moe_inactive
-        active_total = total - moe_inactive
+            if getattr(moe, "expert_parallel", False):
+                local_routed_per_layer = moe.E_per_rank * per_expert_ffn
+                ep_missing = (routed_params_per_layer_global - local_routed_per_layer) * self.config.n_layer
+        transformer_matrices_global = transformer_matrices + ep_missing
+        total_global = wte + value_embeds + lm_head + transformer_matrices_global + scalars
+        active_transformer_matrices = transformer_matrices_global - moe_inactive
+        active_total = total_global - moe_inactive
+        # Expose globals as the canonical "total" values — matches the replicated case and is
+        # what scaling-law analysis wants.
+        transformer_matrices = transformer_matrices_global
+        total = total_global
         return {
             'wte': wte,
             'value_embeds': value_embeds,
