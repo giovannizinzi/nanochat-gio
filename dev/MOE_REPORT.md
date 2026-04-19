@@ -743,10 +743,56 @@ But dense d12 @ 6000 (12.75 min) still gets CORE 0.177 at *lower* wall-clock. Ti
 
 ### Still to try if budget allows
 
-- [ ] aux_coef=0.05 on the best d16 config (P11) — does the same trick help at higher depth?
+- [ ] aux_coef=0.05 on the best d16 config (P11) — does the same trick help at higher depth? (in flight as P14)
 - [ ] `num_shared_experts = 0` ablation — is the shared expert doing work, or is it just insurance?
 - [ ] MoE d18 at 1500 iters (may OOM at E=8; E=4 should fit).
 - [ ] Sinkhorn-style routing implemented cleanly (no aux loss).
+
+---
+
+## Running summary (as of 25+ runs, Phase 2 mid-flight)
+
+**Central question**: does MoE lift the compute → quality frontier for nanochat at d12–d16 within a 20-min/experiment budget?
+
+**Headline answer**: **No, not cleanly.** Dense either wins or ties MoE at every matched-wall-clock budget. The pattern is remarkably consistent across depth, iter-count, and expert configurations.
+
+### What made MoE competitive (but not winning)
+
+Each change moved MoE closer to dense; together they got MoE to "tie within noise" at best:
+
+| Change | Effect |
+|---|---|
+| **top_k=1 (Switch)** over top_k=2 | MFU +5 pp, same quality — clear win |
+| **Router → AdamW** (was Muon) | Big CORE recovery at E=32 from 0.128 → 0.141 |
+| **expert_hidden 2.5–3× auto** (e.g. h=4096 at d12) | MFU 24% → 35%, val_bpb −3%, CORE +0.01 |
+| **capacity_factor=1.0** | −2.7 GiB VRAM, +0.5% throughput, no quality loss |
+| **aux_loss_coef 0.05** (5× default) | +4 mb CORE free at no other cost |
+
+**Best overall MoE config at d12**: E=4 k=1 h=6144 cf=1.0 aux=0.05. Val_bpb 0.805, CORE 0.175 at 14.46 min.
+**Best overall MoE config at d16**: E=4 k=1 h=4096 cf=1.0. Val_bpb 0.788, CORE 0.192 at 18.78 min.
+
+### What didn't help
+
+- E > 32 (per-expert tokens too small, GEMM cliffs, CORE drops).
+- num_experts = top_k (degenerate, no sparsity, worse than dense).
+- E > 64 OOM'd at d12; E=8 h=4096 OOM'd at d16 (expert param replication overhead).
+- >4× iterations (diminishing returns — dense catches up at matched wall-clock).
+
+### Matched-wall-clock verdict across budgets
+
+| Wall-clock | val_bpb winner | CORE winner |
+|---|---|---|
+| 3–6 min | **dense** | **dense** |
+| 12 min | MoE (tiny) | **dense** |
+| 15 min | tied | tied |
+| 19 min | **dense** | **dense** |
+| 25 min | MoE | dense (narrow) |
+
+**So far**: "just go deeper with dense" matches or beats any MoE config we've tried. MoE pays 30–60% more VRAM for a wash-to-small-regression. The verdict holds across depths d12 and d16.
+
+### Running now
+
+**P14: MoE d16 E=4 h=4096 cf=1.0 + aux=0.05 @ 3000 iters** — applying the "free +4 CORE" aux trick (from P13 at d12) to our best d16 config. If it lifts CORE by similar 4 mb at d16, MoE pushes to CORE ~0.196 at ~19 min, getting back in contention with dense d16 @ 5000 (0.197). Tightest matched comparison yet.
 
 
 ## Analysis framework (how we'll answer "did MoE win?")
