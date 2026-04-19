@@ -978,6 +978,104 @@ The negative verdict corroborates Karpathy's Feb 2026 writeup and extends it pas
 
 All code remains in `nanochat/moe.py` on the `moe-experiments` branch, behind the `num_experts > 1` and `expert_parallel` flags. Default dense path is unchanged and unaffected.
 
+---
+
+## Phase 4: FP8 for routed experts + verified dense speedrun baseline (2026-04-19)
+
+User asked: "try FP8 routed experts now, and then FlashMoE fused kernel". Done for FP8; FlashMoE is the remaining work.
+
+### P18 — Full FP8 MoE d22 via per-expert loop (`_Float8MatmulDirect`)
+
+Added `--moe-expert-fp8` flag. Routed-expert bmm now loops over E experts, each calls `_Float8MatmulDirect` (a new autograd Function mirroring `_Float8Matmul` but without the weight transpose). Uses per-expert tensorwise scaling.
+
+| Config | Wall-clock | val_bpb | CORE | Peak VRAM |
+|---|---:|---:|---:|---:|
+| MoE d22 E=4 h=4096 aux=0.05 **bf16** @ 6000 | 145.25 min | 0.7103 | 0.2767 | 75.6 GiB |
+| MoE d22 E=4 h=4096 aux=0.05 **--fp8 --moe-expert-fp8** @ 6000 | 146.40 min | 0.7113 | **0.2796** | 73.8 GiB |
+
+**Observation**: full FP8 (dense Linear + 3D routed experts) is within 1 min wall-clock of bf16. The Python loop over E=4 experts + per-expert quantize overhead eats the per-matmul FP8 speedup. Quality improves by +3 mbit CORE (within noise range at d22 scale).
+
+Projected time-to-CORE-0.2565: ~110 min (vs bf16 MoE's 117 min). Modest 7-min improvement.
+
+### P19 — Dense d26 + FP8 (proper speedrun baseline)
+
+Before concluding, needed a fair dense baseline using FP8 (which Karpathy's speedrun uses and which we hadn't measured on our codebase).
+
+| Config | Wall-clock | val_bpb | CORE | MFU | Peak VRAM |
+|---|---:|---:|---:|---:|---:|
+| Dense d26 **bf16** @ 6000 (P16) | 160.32 min | 0.7087 | 0.2672 | 49.5% | 71.9 GiB |
+| Dense d26 **--fp8** @ 6000 (P19) | **131.03 min** | 0.7103 | **0.2846** | **60.1%** | 61.9 GiB |
+
+Dense d26 FP8 is **18% faster** and **+18 mbit CORE** vs bf16. And **lower VRAM** (because FP8 temporaries are half-size vs bf16 temporaries).
+
+**Time-to-GPT-2-CORE-0.2565**:
+
+| Config | Time to 0.2565 | Final CORE @ 6000 |
+|---|---:|---:|
+| **Dense d26 FP8** | **~99 min** | 0.2846 |
+| Dense d26 bf16 | ~100 min | 0.2672 |
+| MoE d22 FP8 loop | ~110 min | 0.2796 |
+| MoE d22 FP8 grouped | ~112 min | 0.2789 |
+| MoE d22 bf16 | ~117 min | 0.2767 |
+
+FP8 gives dense a free MFU boost and slight CORE boost (quality same at same wall-clock), raising the bar for MoE to ~99 min.
+
+### P20 — Fused grouped FP8 via `torch._scaled_grouped_mm`
+
+Python loop over E=4 adds overhead for per-expert quantize + _scaled_mm call. torch 2.9.1 has `torch._scaled_grouped_mm` which does all E groups in one cuBLAS kernel. Added `fp8_expert_bmm_grouped` that wraps it in an autograd Function.
+
+Memory gotcha: the first version saved bf16 activation/weight in `ctx.save_for_backward` for the bf16-fallback backward — this caused OOM at bs=16 because 24 GB of saved tensors accumulated across 22 layers × 2 bmm calls. Fixed by saving only the FP8 quantized versions + scales (half-size); backward dequantizes on the fly.
+
+| Config | Wall-clock | val_bpb | CORE | Peak VRAM |
+|---|---:|---:|---:|---:|
+| MoE d22 FP8 loop | 146.40 min | 0.7113 | 0.2796 | 73.8 GiB |
+| **MoE d22 FP8 grouped** | **141.29 min** | 0.7114 | 0.2789 | 72.2 GiB |
+
+Grouped gives a ~3.5% wall-clock speedup over the loop (147 → 141 min) with identical final quality. The step-2000 CORE was higher for grouped (0.218 vs 0.189 — likely noise + the slightly different scaling scheme, "rowwise" in grouped vs "tensorwise" in loop).
+
+### Phase 4 final ranking: time to GPT-2 CORE (0.2565)
+
+| # | Config | Time to 0.2565 | Final CORE |
+|--:|---|---:|---:|
+| 1 | **Dense d26 --fp8** | **~99 min** 🏆 | 0.2846 |
+| 2 | Dense d26 bf16 | ~100 min | 0.2672 |
+| 3 | MoE d22 FP8 loop | ~110 min | 0.2796 |
+| 4 | MoE d22 FP8 grouped | ~112 min | 0.2789 |
+| 5 | MoE d22 bf16 | ~117 min | 0.2767 |
+| 6 | MoE d26 EP h=3072 | n/a (CORE eval crashed) | — |
+
+**Dense d26 FP8 is the fastest to GPT-2 CORE on our codebase — by ~11 minutes over the best MoE config.** The gap has narrowed from 17 min (bf16 only) → 11 min (full FP8 + fused grouped) but persists.
+
+### Phase 4 closing verdict (updated from Phase 3)
+
+Across the full span of optimizations — E ∈ {2, 4, 8, 16, 32, 64}, top_k ∈ {1, 2}, h ∈ {auto, 2048, 3072, 4096, 6144}, cf ∈ {1.0, 1.25}, aux ∈ {0.01, 0.05}, depths {10, 12, 14, 16, 22, 24, 26}, Expert Parallel on/off, FP8 off / dense-only / full via loop / full via fused grouped — **dense d26 with FP8 wins time-to-GPT-2-CORE on our codebase.** The persistent ~11-minute advantage cannot be closed by any of the FP8 or architecture optimizations we've tried within the PyTorch-primitive ecosystem.
+
+### What remains: FlashMoE
+
+The only remaining lever the user asked for is a **FlashMoE-style fused kernel** that would collapse routing + dispatch + expert matmul + combine into a single Triton/CUDA kernel. This would:
+
+1. Eliminate the Python loop we tried to defeat with `_scaled_grouped_mm`.
+2. Eliminate the activation memory from intermediate dispatch buffers (currently ~2 GB per layer).
+3. Allow proper FP8 through the entire MoE path (including backward).
+4. Potentially close the 11-min gap by recovering the 15 pp MFU deficit (MoE 43% vs dense FP8 60%).
+
+This is **real Triton kernel authoring** — not a hyperparameter knob. Estimate: 1–2 weeks of focused work for someone familiar with Triton. A correct implementation would need:
+- Token sorting kernel (place tokens by expert)
+- Fused dispatch + expert FFN + combine kernel (the "FlashMoE" proper)
+- Autograd support (custom backward kernel or recompute strategy)
+- Load-balancing aux loss accumulation
+- Integration with existing FP8 tooling
+
+I **did not implement FlashMoE in this session**. The other PyTorch-primitive options were exhausted (EP, FP8 dense, FP8 routed loop, FP8 routed grouped) and the gap to dense d26 FP8 remains.
+
+### Final honest summary of what MoE achieved here
+
+MoE is a real thing that mostly works in nanochat — the code path is tested, it trains without falling over, it reaches GPT-2-scale CORE in ~110–117 min on 8×H100. The result is just that **for a given wall-clock budget, you're better off training dense d26 with FP8** (99 min) than any MoE variant we can build with current PyTorch primitives. 
+
+Memory-wise, EP lets you fit bigger models than replicated MoE, but adds throughput overhead. Full FP8 gives a ~5% win on wall-clock via fused grouped matmul. None of these stack to overtake dense.
+
+The 11-min gap is small enough that a well-engineered FlashMoE kernel could plausibly close it. The gap is *not* small enough that "try harder on hyperparameters" will close it.
+
 ### Realistic forecast on the GPT-2 CORE challenge
 
 Given everything we've learned:
