@@ -45,6 +45,7 @@ class GPTConfig:
     capacity_factor: float = 1.25
     moe_aux_loss_coef: float = 0.01
     expert_hidden_dim: int = -1  # -1 = auto (compute-matched to dense active FFN)
+    expert_parallel: bool = False  # if True (+ num_experts % world_size == 0), shard experts across GPUs
 
 
 def norm(x):
@@ -422,11 +423,19 @@ class GPT(nn.Module):
         # MoE router weights want AdamW (flexible triage), not Muon (which orthogonalizes).
         # Pull them out of matrix_params before Muon grouping.
         router_params = []
+        # Under Expert Parallel mode, each rank holds different routed-expert weights.
+        # Those must NOT be collective-reduced during the optimizer step (unlike
+        # replicated matrix params). Collect them separately so setup_optimizer can
+        # mark the Muon group as non-replicated.
+        ep_expert_params = []
         if self.config.num_experts > 1:
             for block in self.transformer.h:
                 router_params.append(block.mlp.router_weight)
-            router_ids = {id(p) for p in router_params}
-            matrix_params = [p for p in matrix_params if id(p) not in router_ids]
+                if getattr(block.mlp, "expert_parallel", False):
+                    ep_expert_params.append(block.mlp.w_fc)
+                    ep_expert_params.append(block.mlp.w_proj)
+            exclude_ids = {id(p) for p in router_params + ep_expert_params}
+            matrix_params = [p for p in matrix_params if id(p) not in exclude_ids]
         value_embeds_params = list(self.value_embeds.parameters())
         embedding_params = list(self.transformer.wte.parameters())
         lm_head_params = list(self.lm_head.parameters())
@@ -462,7 +471,19 @@ class GPT(nn.Module):
             param_groups.append(dict(
                 kind='muon', params=group_params, lr=matrix_lr,
                 momentum=0.95, ns_steps=5, beta2=0.9, weight_decay=weight_decay,
+                replicated=True,
             ))
+        # Expert Parallel routed-expert groups: each rank holds a unique slice of experts,
+        # so the optimizer must NOT reduce gradients across ranks. Muon still orthogonalizes
+        # each (D, H) slice independently via its batched polar-express (leading dims OK).
+        if ep_expert_params:
+            for shape in sorted({p.shape for p in ep_expert_params}):
+                group_params = [p for p in ep_expert_params if p.shape == shape]
+                param_groups.append(dict(
+                    kind='muon', params=group_params, lr=matrix_lr,
+                    momentum=0.95, ns_steps=5, beta2=0.9, weight_decay=weight_decay,
+                    replicated=False,
+                ))
 
         Factory = DistMuonAdamW if ddp else MuonAdamW
         optimizer = Factory(param_groups)

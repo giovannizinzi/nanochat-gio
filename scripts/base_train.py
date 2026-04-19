@@ -59,6 +59,7 @@ parser.add_argument("--num-shared-experts", type=int, default=0, help="DeepSeek-
 parser.add_argument("--capacity-factor", type=float, default=1.25, help="per-expert capacity = ceil(cf * top_k * N / E); overflow tokens drop")
 parser.add_argument("--moe-aux-loss-coef", type=float, default=0.01, help="Switch-style load-balancing aux loss coefficient")
 parser.add_argument("--expert-hidden-dim", type=int, default=-1, help="per-expert FFN hidden dim (-1 = auto, compute-matched to dense)")
+parser.add_argument("--expert-parallel", action="store_true", help="shard routed experts across GPUs via all_to_all_single (requires num_experts % world_size == 0)")
 # Training horizon (only one used, in order of precedence)
 parser.add_argument("--num-iterations", type=int, default=-1, help="explicit number of optimization steps (-1 = disable)")
 parser.add_argument("--target-flops", type=float, default=-1.0, help="calculate num_iterations to reach target_flops (-1 = disable)")
@@ -149,6 +150,7 @@ def build_model_meta(depth):
         capacity_factor=args.capacity_factor,
         moe_aux_loss_coef=args.moe_aux_loss_coef,
         expert_hidden_dim=args.expert_hidden_dim,
+        expert_parallel=args.expert_parallel,
     )
     with torch.device("meta"):
         model_meta = GPT(config)
