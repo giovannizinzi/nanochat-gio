@@ -823,7 +823,34 @@ First data point (step 2000 CORE = 0.1972) is already at the level our dense d16
 
 Also of note: **MFU at d22 is 43%** — our best MFU ever, up from 24–35% at d12/d16. Bigger per-expert matmuls actually saturate H100 tensor cores properly. The throughput side of MoE only starts to look good at ≥d22.
 
-*Expected: CORE final around 0.22–0.23 at 6000 iters (under-trained — compute-optimal at d22 would be ~11000 iters). Will update.*
+#### P15 results — MoE d22 beats GPT-2 CORE in 145 min
+
+| Step | val_bpb | CORE |
+|---:|---:|---:|
+| 2000 | — | 0.1972 |
+| 4000 | 0.7529 | **0.2407** |
+| 6000 (final) | **0.7103** | **0.2767** |
+
+| Metric | Value |
+|---|---|
+| Wall-clock | **145.25 min (~2.42 hr)** |
+| Peak VRAM | 75.6 GiB |
+| MFU | 43.0% (best ever) |
+| CORE vs GPT-2 (0.2565) | **+0.0202 (+7.9% relative)** |
+
+**MoE decisively cleared GPT-2 CORE.** CORE trajectory 0.20 → 0.24 → 0.28 shows a clean log-linear improvement — not tapering off. If we'd let this run longer, CORE would still be rising.
+
+Karpathy's reported dense d26 speedrun (on his branch with FP8): **~180 min for CORE ~0.256**. Our MoE hit 0.276 in 145 min — prima-facie faster and higher. But his run is on a different codebase with different optimizations (FP8, etc). **Need to verify on *our* codebase** with a dense d26 run.
+
+### P16 — dense d26 on our codebase (verification, in flight)
+
+Running dense d26 with the same 6000 iters, device_batch_size=16, core_metric_every=2000. This is the head-to-head comparison. Expected step time ~800–1000 ms (d26 dense without MoE dispatch overhead), so total ~90–120 min. CORE intermediate evals will show when it crosses 0.2565.
+
+**The verdict criterion:**
+- If dense d26 reaches CORE 0.2565 **in less than 145 min**, MoE is NOT faster on our codebase — Karpathy's 180-min figure is slower than his branch can actually do with current optimizations.
+- If dense d26 takes **more than 145 min** to reach CORE 0.2565 (or doesn't reach it in 6000 iters), then **MoE wins the "time to GPT-2 CORE" race on our codebase**.
+
+*Result TBD.*
 
 ### Realistic forecast on the GPT-2 CORE challenge
 
