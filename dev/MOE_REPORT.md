@@ -728,9 +728,22 @@ d16    4   1      4096           1.0   3000  AdamW       18.78 min   0.7883   0.
 
 *Muon router was the buggy path; all results after commit `8001c63` use AdamW routers.*
 
+### P13 — MoE d12 E=4 k=1 h=6144 cf=1.0 **aux_coef=0.05** @ 3000 (5× default)
+
+| Config | val_bpb | CORE | wall-clock | train/aux_loss (final) |
+|---|---:|---:|---:|---:|
+| MoE d12 E=4 h=6144 aux=0.01 @ 3000 (P10) | 0.8044 | 0.1705 | 14.49 min | 0.12 |
+| MoE d12 E=4 h=6144 **aux=0.05** @ 3000 | 0.8047 | **0.1749** | 14.46 min | 0.60 |
+
+**Tighter load balance (5× aux coef) gave +4mb CORE with no val_bpb or wall-clock cost.** Small but real positive result. The 5× aux coef keeps the measured aux loss higher (0.60 vs 0.12 at convergence), which indicates the router is working harder to evenly distribute tokens. This supports the interpretation that *some* of MoE's CORE gap vs dense is "experts specialize on frequent patterns and flail on rare ones during eval" — tighter load balance during training gives more exposure to rare patterns per expert.
+
+The new best MoE config at ~14.5 min wall-clock: **MoE d12 E=4 k=1 h=6144 cf=1.0 aux=0.05 @ 3000**: val 0.805, CORE 0.175.
+
+But dense d12 @ 6000 (12.75 min) still gets CORE 0.177 at *lower* wall-clock. Tighter load balance didn't break the pattern.
+
 ### Still to try if budget allows
 
-- [ ] Higher `aux_loss_coef` (0.05) at d12/d16 — force more balanced routing to boost CORE.
+- [ ] aux_coef=0.05 on the best d16 config (P11) — does the same trick help at higher depth?
 - [ ] `num_shared_experts = 0` ablation — is the shared expert doing work, or is it just insurance?
 - [ ] MoE d18 at 1500 iters (may OOM at E=8; E=4 should fit).
 - [ ] Sinkhorn-style routing implemented cleanly (no aux loss).
