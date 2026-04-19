@@ -642,12 +642,98 @@ Best config at each wall-clock bucket (updated):
 3. **Beyond 15 min, MoE wins val_bpb clearly but dense catches up / wins CORE** — val_bpb and CORE diverge. MoE seems to overfit validation loss while dense's downstream performance keeps scaling.
 4. **Going deeper with dense consistently competes with MoE.** At the miniseries level ("which config lifts the d10→d20 frontier?"), dense d16 often matches MoE d12 in the same wall-clock.
 
-### Still to try
+### P12 — Dense d16 @ 5000 iters (matched wall-clock to best MoE d16)
 
-- [ ] Dense d16 @ 5000 (in flight) — confirm extrapolation
-- [ ] Higher aux_loss_coef (0.05) at d12/d16 — force more balanced routing to boost CORE
-- [ ] MoE d18 or d20 (may not fit VRAM at E=8)
-- [ ] Sinkhorn routing (no aux loss)
+| Config | val_bpb | CORE | wall-clock | Peak VRAM |
+|---|---:|---:|---:|---:|
+| Dense d16 @ 5000 | **0.7844** | **0.1966** | 19.32 min | 46.6 GiB |
+| MoE d16 E=4 h=4096 cf=1.0 @ 3000 | 0.7883 | 0.1919 | 18.78 min | 73.1 GiB |
+
+**At matched ~19 min, dense d16 beats our best MoE config on BOTH metrics, using 36% less VRAM.** The extrapolated-from-trend CORE estimate for dense (0.211) was too optimistic (actual 0.197) — the CORE curve flattens faster at longer training than the short-run trend predicts. But even at the lower actual number, dense still wins CORE, and it wins val_bpb too.
+
+### Phase 2 verdict — refined after 20+ runs spanning iters {1500, 3000, 5000, 6000, 12000} × depths {12, 16} × E in {4, 8} × h in {auto, 4096, 6144}
+
+**Across every matched-wall-clock comparison we've run, dense either wins or ties MoE within noise.** There is no wall-clock bucket where MoE clearly beats dense on both metrics simultaneously. The pattern:
+
+| Wall-clock | Winner (val_bpb) | Winner (CORE) | Margin |
+|---|---|---|---|
+| ~3–6 min | Dense | Dense | Clear |
+| ~12 min | MoE d12 (slight) | Dense | Split |
+| ~15 min | Tied (within noise) | Tied (within noise) | Toss-up |
+| ~19 min | **Dense** | **Dense** | Clear |
+| ~25 min | MoE | Dense (narrow) | Split |
+
+A "slight MoE lead at one budget but slight dense lead at adjacent budgets" is not a frontier lift — it's noise between two curves that are essentially on top of each other in this regime.
+
+### What made MoE competitive (not winning — competitive)
+
+Of all the knobs I turned, these mattered enough to appear in a final best config:
+
+1. **top_k = 1** (Switch-style). Cuts dispatch/gather work in half vs top_k = 2 without losing much per-step quality. All our best configs use k=1.
+2. **Explicit `expert_hidden_dim`** at 2.5–3× the compute-matched auto value. Bigger matmuls use tensor cores better. MoE's MFU goes from 24% (auto) to 35% (h=4096) — the single biggest throughput improvement we found.
+3. **Router on AdamW, experts on Muon**. Muon orthogonalizes; the router needs to concentrate mass on a few experts per token, which is the opposite of what orthogonalization does. Switching router to AdamW clearly helped CORE.
+4. **capacity_factor = 1.0** (Noam's tip). Small throughput + VRAM savings, no quality loss in our runs. Take this as the default.
+5. **1 shared expert**. We didn't test num_shared = 0 or 2 exhaustively, but DeepSeek convention (1 shared + routed) has been fine.
+
+### What did NOT help
+
+- **num_experts > 32**. Per-expert token count drops, GEMM efficiency tanks, CORE regresses. E=64 was worse than E=32; E=128 OOM'd.
+- **num_experts = 2 with top_k = 2**. Degenerate: all experts active for every token, fragmented matmuls, zero sparsity. Strictly worse than dense.
+- **More than 4× iterations**. Returns diminish, dense catches up at matched wall-clock.
+
+### What we didn't try
+
+- **Sinkhorn / transport-based routing** (replaces aux loss). Code change significant enough that we'd want a dedicated session.
+- **Expert parallelism** (experts sharded across GPUs instead of replicated). Would let us fit E=128+ without OOM, and would fundamentally change the memory-bandwidth profile of dispatch. This is the single change most likely to flip the verdict — our MFU is memory-bound, and EP attacks exactly that bottleneck.
+- **Fused FlashMoE kernel**. Doesn't exist as a stable PyTorch primitive. If it did, our MFU would recover to ~35–40% (near dense) and the whole landscape changes.
+- **d18+ at long training**. Might or might not flip verdict. Depth-scaling so far has been neutral — dense depth dial competes well with MoE.
+
+### Final practitioner-oriented takeaway
+
+For the nanochat miniseries (d10 → d20, ~5 min to ~1 hour training budgets on 8×H100):
+
+> **Just go deeper with dense.** You pay 30–60% more VRAM for MoE and get either a wash or a small regression vs running dense at a higher depth with the same wall-clock.
+
+MoE is not a miniseries-lifting change at this scale with the tools we have. To make it one, we'd need (in decreasing order of plausibility): expert parallelism, a FlashMoE-style kernel, or evidence that the trend flips decisively at d20+ or at training budgets we can't fit in a 20-min window.
+
+### Running log of *every* configuration tried (for future maintainers)
+
+See the run-level tables above. Key data points condensed:
+
+```
+depth  E   top_k  expert_hidden  cf    iters  router_opt  wall_clock  val_bpb  CORE
+-----  --  -----  -------------  ----  -----  ----------  ----------  -------  -----
+d12    —   dense   3072           —     1500  AdamW        3.18 min   0.8749   0.1429
+d12    —   dense   3072           —     3000  AdamW        6.36 min   0.8395   0.1651
+d12    —   dense   3072           —     6000  AdamW       12.75 min   0.8154   0.1769
+d12    —   dense   3072           —    12000  AdamW       25.53 min   0.7991   0.2037
+d12    2   2      1024           1.25  1500  Muon*        4.33 min   0.8773   0.1269
+d12    4   2       870           1.25  1500  Muon*        4.86 min   0.8713   0.1403
+d12    8   2      1024           1.25  1500  Muon*        6.03 min   0.8659   0.1275
+d12    32  1      1536           1.25  1500  AdamW        4.95 min   0.8572   0.1408
+d12    64  1      1536           1.25  1500  AdamW        ?          0.8626   0.1230
+d12    8   1      4096           1.25  1500  AdamW        6.31 min   0.8458   0.1455
+d12    8   1      4096           1.0   6000  AdamW       24.98 min   0.7796   0.2000
+d12    4   1      4096           1.0   3000  AdamW       11.61 min   0.8111   0.1646
+d12    4   1      6144           1.0   3000  AdamW       14.49 min   0.8044   0.1705
+d16    —   dense   4096           —     1500  AdamW        5.79 min   0.8473   0.1502
+d16    —   dense   4096           —     3000  AdamW       11.59 min   0.8069   0.1888
+d16    —   dense   4096           —     5000  AdamW       19.32 min   0.7844   0.1966
+d16    8   1      2048           1.25  1500  AdamW        7.44 min   0.8390   0.1639
+d16    8   1      2048           1.25  3000  AdamW       14.79 min   0.7973   0.1889
+d16    8   1      2048           1.0   3000  AdamW       14.59 min   0.7981   0.1934
+d16    4   1      4096           1.0   1500  AdamW        9.47 min   0.8306   0.1524
+d16    4   1      4096           1.0   3000  AdamW       18.78 min   0.7883   0.1919
+```
+
+*Muon router was the buggy path; all results after commit `8001c63` use AdamW routers.*
+
+### Still to try if budget allows
+
+- [ ] Higher `aux_loss_coef` (0.05) at d12/d16 — force more balanced routing to boost CORE.
+- [ ] `num_shared_experts = 0` ablation — is the shared expert doing work, or is it just insurance?
+- [ ] MoE d18 at 1500 iters (may OOM at E=8; E=4 should fit).
+- [ ] Sinkhorn-style routing implemented cleanly (no aux loss).
 
 
 ## Analysis framework (how we'll answer "did MoE win?")
