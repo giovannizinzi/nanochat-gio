@@ -183,10 +183,15 @@ class MoE(nn.Module):
         w_proj = self.w_proj.to(x_flat.dtype)
         if self.moe_expert_fp8:
             # Lazy import to avoid circular deps at module load time.
-            from nanochat.fp8 import fp8_expert_bmm
-            hidden = fp8_expert_bmm(expert_inputs, w_fc)
+            # Prefer the fused grouped-matmul path (single cuBLAS kernel) when available;
+            # fall back to the per-expert Python loop otherwise.
+            try:
+                from nanochat.fp8 import fp8_expert_bmm_grouped as _bmm_fn
+            except Exception:
+                from nanochat.fp8 import fp8_expert_bmm as _bmm_fn
+            hidden = _bmm_fn(expert_inputs, w_fc)
             hidden = F.relu(hidden).square()
-            expert_output = fp8_expert_bmm(hidden, w_proj)
+            expert_output = _bmm_fn(hidden, w_proj)
         else:
             hidden = torch.bmm(expert_inputs, w_fc)
             hidden = F.relu(hidden).square()

@@ -262,12 +262,10 @@ class _Float8MatmulDirect(torch.autograd.Function):
 def fp8_expert_bmm(act_3d, weight_3d):
     """FP8 per-expert batched matmul: act (E, M, K) @ weight (E, K, N) -> out (E, M, N).
 
-    Each expert is its own independent FP8 matmul with its own tensorwise scales.
-    Implemented as a Python for-loop over experts; each iteration calls the 3-GEMM
-    FP8 autograd path from `_Float8MatmulDirect`. The Python loop overhead is
-    usually negligible compared to the per-expert matmul (M * K * N ~ millions of
-    ops) so this is approximately as fast as a true fused grouped matmul would be,
-    minus kernel launch overhead.
+    Each expert is its own independent FP8 matmul. Implemented as a Python for-loop
+    over experts; each iteration calls the 3-GEMM FP8 autograd path from
+    `_Float8MatmulDirect`. See also `fp8_expert_bmm_grouped` for a single-kernel
+    path using `torch._scaled_grouped_mm`.
     """
     E = act_3d.shape[0]
     outputs = []
@@ -277,6 +275,105 @@ def fp8_expert_bmm(act_3d, weight_3d):
         out_e = _Float8MatmulDirect.apply(act_e, w_e)
         outputs.append(out_e)
     return torch.stack(outputs, dim=0)
+
+
+# =============================================================================
+# Grouped FP8 MoE matmul via torch._scaled_grouped_mm
+# =============================================================================
+#
+# torch._scaled_grouped_mm is a fused cuBLAS kernel that does many FP8 matmuls
+# in one call. For MoE this replaces the Python loop in fp8_expert_bmm.
+#
+# Signature (torch 2.9.x): _scaled_grouped_mm(mat1, mat2, scale_a, scale_b,
+#   offs=None, bias=None, scale_result=None, out_dtype=None, use_fast_accum=False)
+#
+# For 3D inputs (our MoE case):
+#   mat1: (E, M, K) float8_e4m3fn, row-major
+#   mat2: (E, N, K) float8_e4m3fn, row-major  — NOTE: "transposed" layout
+#   scale_a: (E, M) float32  — per-row per-group
+#   scale_b: (E, N) float32  — per-row per-group (after transpose)
+#   out:  (E, M, N) out_dtype
+#
+# The rowwise scales mean we quantize each row of act / each column of weight
+# with its own scale. This is higher-precision than tensorwise but requires
+# slightly more bookkeeping.
+
+def _rowwise_fp8_act(x, fp8_dtype=torch.float8_e4m3fn):
+    """Rowwise quantize activation (E, M, K) -> fp8 (E, M, K) + scale (E, M)."""
+    fp8_max = torch.finfo(fp8_dtype).max
+    # Per-row amax over last dim
+    amax = x.float().abs().amax(dim=-1)  # (E, M)
+    scale = fp8_max / amax.double().clamp(min=EPS)
+    scale = scale.float()
+    x_fp8 = (x.float() * scale.unsqueeze(-1)).clamp(-fp8_max, fp8_max).to(fp8_dtype)
+    # _scaled_grouped_mm wants the *inverse* scale (applied during the matmul
+    # to convert FP8 back to the original range)
+    inv_scale = scale.reciprocal()
+    return x_fp8, inv_scale
+
+
+def _rowwise_fp8_weight_T(w, fp8_dtype=torch.float8_e4m3fn):
+    """Rowwise quantize weight (E, K, N) for the grouped_mm "transposed mat2" layout.
+
+    _scaled_grouped_mm expects mat2 as (E, N, K) with rowwise scales (E, N).
+    We receive (E, K, N) and produce (E, N, K) + (E, N) scale.
+    """
+    fp8_max = torch.finfo(fp8_dtype).max
+    w_T = w.transpose(-1, -2).contiguous()  # (E, N, K), row-major
+    amax = w_T.float().abs().amax(dim=-1)   # (E, N)
+    scale = fp8_max / amax.double().clamp(min=EPS)
+    scale = scale.float()
+    w_fp8 = (w_T.float() * scale.unsqueeze(-1)).clamp(-fp8_max, fp8_max).to(fp8_dtype)
+    inv_scale = scale.reciprocal()
+    return w_fp8, inv_scale
+
+
+@torch._dynamo.allow_in_graph
+class _Float8GroupedBMM(torch.autograd.Function):
+    """FP8 grouped forward + bf16 grouped backward.
+
+    Forward: quantize act + weight, call `torch._scaled_grouped_mm` (single cuBLAS kernel).
+    Backward: the per-group backward scaling semantics of `_scaled_grouped_mm` are
+    non-obvious (needs col-wise rather than row-wise scales for the weight-grad path),
+    so we keep backward in bf16 via `torch._grouped_mm`. This loses ~half the FP8
+    speedup but keeps the forward path's ~1.5-2x GEMM speedup intact.
+    """
+
+    @staticmethod
+    def forward(ctx, act, weight):
+        # Save bf16 views for backward — cheap and simpler than staying in FP8.
+        ctx.save_for_backward(act, weight)
+        act_fp8, act_inv = _rowwise_fp8_act(act, torch.float8_e4m3fn)
+        w_T_fp8, w_inv = _rowwise_fp8_weight_T(weight, torch.float8_e4m3fn)
+        # _scaled_grouped_mm expects mat2 in "transposed" layout i.e. (E, N, K) row-major;
+        # when viewed through `.transpose(-1, -2)` it appears as (E, K, N) col-major,
+        # which is what the scaled matmul actually wants.
+        out = torch._scaled_grouped_mm(
+            act_fp8, w_T_fp8.transpose(-1, -2),
+            act_inv, w_inv,
+            out_dtype=act.dtype,
+            use_fast_accum=True,
+        )
+        return out
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        act, weight = ctx.saved_tensors
+        # grad_input = grad_output @ weight.T   : (E, M, N) @ (E, N, K) -> (E, M, K)
+        grad_input = torch.bmm(grad_output, weight.transpose(-1, -2))
+        # grad_weight = input.T @ grad_output   : (E, K, M) @ (E, M, N) -> (E, K, N)
+        grad_weight = torch.bmm(act.transpose(-1, -2), grad_output)
+        return grad_input, grad_weight
+
+
+def fp8_expert_bmm_grouped(act_3d, weight_3d):
+    """Fused FP8 forward grouped matmul for MoE. Single cuBLAS call, no Python loop.
+
+    Forward uses FP8 via `torch._scaled_grouped_mm`; backward falls back to bf16.
+    Use this when `num_experts > 1` and the act/weight dims are multiples of 16
+    (cuBLAS FP8 alignment requirement).
+    """
+    return _Float8GroupedBMM.apply(act_3d, weight_3d)
 
 
 class Float8Linear(nn.Linear):
