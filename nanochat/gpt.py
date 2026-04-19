@@ -21,6 +21,7 @@ import torch.nn.functional as F
 
 from nanochat.common import get_dist_info, print0, COMPUTE_DTYPE
 from nanochat.optim import MuonAdamW, DistMuonAdamW
+from nanochat.moe import MoE
 
 # Our custom Flash Attention module that automatically uses FA3 on Hopper+ and SDPA fallback elsewhere
 from nanochat.flash_attention import flash_attn
@@ -37,6 +38,15 @@ class GPTConfig:
     # Characters: L=long (full context), S=short (quarter context)
     # Examples: "L"=all full context, "SL"=alternating, "SSL"=two short then one long
     window_pattern: str = "SSSL"
+    # MoE config. num_experts <= 1 disables MoE entirely (falls back to dense MLP).
+    num_experts: int = 1
+    top_k: int = 2
+    num_shared_experts: int = 0
+    capacity_factor: float = 1.25
+    moe_aux_loss_coef: float = 0.01
+    expert_hidden_dim: int = -1  # -1 = auto (compute-matched to dense active FFN)
+    expert_parallel: bool = False  # if True (+ num_experts % world_size == 0), shard experts across GPUs
+    moe_expert_fp8: bool = False   # if True, use FP8 matmuls for routed expert bmm (per-expert tensorwise scaling)
 
 
 def norm(x):
@@ -143,12 +153,18 @@ class Block(nn.Module):
     def __init__(self, config, layer_idx):
         super().__init__()
         self.attn = CausalSelfAttention(config, layer_idx)
-        self.mlp = MLP(config)
+        self.use_moe = config.num_experts > 1
+        self.mlp = MoE(config) if self.use_moe else MLP(config)
 
     def forward(self, x, ve, cos_sin, window_size, kv_cache):
         x = x + self.attn(norm(x), ve, cos_sin, window_size, kv_cache)
-        x = x + self.mlp(norm(x))
-        return x
+        if self.use_moe:
+            mlp_out, aux = self.mlp(norm(x))
+            x = x + mlp_out
+        else:
+            x = x + self.mlp(norm(x))
+            aux = torch.zeros((), device=x.device, dtype=torch.float32)
+        return x, aux
 
 
 class GPT(nn.Module):
@@ -226,8 +242,11 @@ class GPT(nn.Module):
             torch.nn.init.uniform_(block.attn.c_k.weight, -s, s)
             torch.nn.init.uniform_(block.attn.c_v.weight, -s, s)
             torch.nn.init.zeros_(block.attn.c_proj.weight) # projections are zero
-            torch.nn.init.uniform_(block.mlp.c_fc.weight, -s * 0.4, s * 0.4)  # 0.4x init scale for c_fc
-            torch.nn.init.zeros_(block.mlp.c_proj.weight)
+            if block.use_moe:
+                block.mlp.init_weights()  # MoE does its own init (zero c_proj => zero contribution at init)
+            else:
+                torch.nn.init.uniform_(block.mlp.c_fc.weight, -s * 0.4, s * 0.4)  # 0.4x init scale for c_fc
+                torch.nn.init.zeros_(block.mlp.c_proj.weight)
 
         # Per-layer scalars
         # Per-layer resid init: stronger residual at early layers, weaker at deep layers
@@ -325,6 +344,9 @@ class GPT(nn.Module):
         This is ~1% off from the exact formulas of Chinchilla paper, the difference is:
         - Chinchilla counts the embedding layer as flops (? weird, it's just a lookup => we ignore)
         - Chinchilla counts exp/sum/divide in attention softmax as flops (a little sus and very tiny => we ignore)
+
+        For MoE: only top_k / num_experts of routed expert params see a given token per forward.
+        Shared experts and the router are always active (included in the active count).
         """
         nparams = sum(p.numel() for p in self.parameters())
         # Exclude non-matmul params: embeddings and per-layer scalars
@@ -332,6 +354,13 @@ class GPT(nn.Module):
         nparams_exclude = (self.transformer.wte.weight.numel() + value_embeds_numel +
                           self.resid_lambdas.numel() + self.x0_lambdas.numel() +
                           self.smear_gate.weight.numel() + self.smear_lambda.numel() + self.backout_lambda.numel())
+        # Exclude inactive MoE expert params: (num_experts - top_k) / num_experts of routed experts.
+        moe_inactive = 0
+        if self.config.num_experts > 1:
+            moe = self.transformer.h[0].mlp
+            expert_hidden = moe.expert_hidden_dim
+            inactive_per_layer = (self.config.num_experts - self.config.top_k) * 2 * self.config.n_embd * expert_hidden
+            moe_inactive = inactive_per_layer * self.config.n_layer
         h, q, t = self.config.n_head, self.config.n_embd // self.config.n_head, self.config.sequence_len
         # Sum attention FLOPs per layer, accounting for sliding window
         attn_flops = 0
@@ -339,7 +368,7 @@ class GPT(nn.Module):
             window = window_size[0]  # (left, right) tuple, we use left
             effective_seq = t if window < 0 else min(window, t)
             attn_flops += 12 * h * q * effective_seq
-        num_flops_per_token = 6 * (nparams - nparams_exclude) + attn_flops
+        num_flops_per_token = 6 * (nparams - nparams_exclude - moe_inactive) + attn_flops
         return num_flops_per_token
 
     def num_scaling_params(self):
@@ -351,24 +380,52 @@ class GPT(nn.Module):
         Ref: https://arxiv.org/abs/2203.15556 (Chinchilla paper)
         Ref: https://arxiv.org/abs/2001.08361 (Kaplan et al. original scaling laws paper)
 
-        Returns a dict with counts for each parameter group, so downstream analysis
-        can experiment with which combination gives the cleanest scaling laws.
+        For MoE, 'active_*' fields count only the parameters active per token
+        (top_k out of num_experts routed experts, plus shared experts).
+        Following DeepSeek convention of reporting both total and active params.
         """
-        # Count each group separately (mirrors the grouping in setup_optimizers)
+        # Count each group separately (mirrors the grouping in setup_optimizers).
         wte = sum(p.numel() for p in self.transformer.wte.parameters())
         value_embeds = sum(p.numel() for p in self.value_embeds.parameters())
         lm_head = sum(p.numel() for p in self.lm_head.parameters())
         transformer_matrices = sum(p.numel() for p in self.transformer.h.parameters())
         scalars = self.resid_lambdas.numel() + self.x0_lambdas.numel() + self.smear_gate.weight.numel() + self.smear_lambda.numel() + self.backout_lambda.numel()
-        total = wte + value_embeds + lm_head + transformer_matrices + scalars
-        assert total == sum(p.numel() for p in self.parameters()), "Parameter count mismatch"
+        # Under Expert Parallel, this rank only holds E/world_size routed experts. The local
+        # transformer_matrices count is therefore missing the (world_size-1)/world_size of
+        # routed experts that live on other ranks. Upgrade to a "global" count so downstream
+        # scaling-law math (active_* etc.) sees the full logical model.
+        moe_inactive = 0
+        ep_missing = 0  # routed-expert params held on OTHER ranks under EP
+        if self.config.num_experts > 1:
+            moe = self.transformer.h[0].mlp
+            expert_hidden = moe.expert_hidden_dim
+            per_expert_ffn = 2 * self.config.n_embd * expert_hidden
+            # Global routed-expert params (across all ranks if EP is on)
+            routed_params_per_layer_global = self.config.num_experts * per_expert_ffn
+            # Inactive per token = (num_experts - top_k) fraction of routed params
+            inactive_per_layer = routed_params_per_layer_global - (self.config.top_k * per_expert_ffn)
+            moe_inactive = inactive_per_layer * self.config.n_layer
+            if getattr(moe, "expert_parallel", False):
+                local_routed_per_layer = moe.E_per_rank * per_expert_ffn
+                ep_missing = (routed_params_per_layer_global - local_routed_per_layer) * self.config.n_layer
+        transformer_matrices_global = transformer_matrices + ep_missing
+        total_global = wte + value_embeds + lm_head + transformer_matrices_global + scalars
+        active_transformer_matrices = transformer_matrices_global - moe_inactive
+        active_total = total_global - moe_inactive
+        # Expose globals as the canonical "total" values — matches the replicated case and is
+        # what scaling-law analysis wants.
+        transformer_matrices = transformer_matrices_global
+        total = total_global
         return {
             'wte': wte,
             'value_embeds': value_embeds,
             'lm_head': lm_head,
             'transformer_matrices': transformer_matrices,
+            'active_transformer_matrices': active_transformer_matrices,
             'scalars': scalars,
+            'moe_inactive': moe_inactive,
             'total': total,
+            'active_total': active_total,
         }
 
     def setup_optimizer(self, unembedding_lr=0.004, embedding_lr=0.2, matrix_lr=0.02, weight_decay=0.0, scalar_lr=0.5):
@@ -377,13 +434,29 @@ class GPT(nn.Module):
 
         # Separate out all parameters into groups
         matrix_params = list(self.transformer.h.parameters())
+        # MoE router weights want AdamW (flexible triage), not Muon (which orthogonalizes).
+        # Pull them out of matrix_params before Muon grouping.
+        router_params = []
+        # Under Expert Parallel mode, each rank holds different routed-expert weights.
+        # Those must NOT be collective-reduced during the optimizer step (unlike
+        # replicated matrix params). Collect them separately so setup_optimizer can
+        # mark the Muon group as non-replicated.
+        ep_expert_params = []
+        if self.config.num_experts > 1:
+            for block in self.transformer.h:
+                router_params.append(block.mlp.router_weight)
+                if getattr(block.mlp, "expert_parallel", False):
+                    ep_expert_params.append(block.mlp.w_fc)
+                    ep_expert_params.append(block.mlp.w_proj)
+            exclude_ids = {id(p) for p in router_params + ep_expert_params}
+            matrix_params = [p for p in matrix_params if id(p) not in exclude_ids]
         value_embeds_params = list(self.value_embeds.parameters())
         embedding_params = list(self.transformer.wte.parameters())
         lm_head_params = list(self.lm_head.parameters())
         resid_params = [self.resid_lambdas]
         x0_params = [self.x0_lambdas]
         smear_params = [self.smear_gate.weight, self.smear_lambda, self.backout_lambda]
-        assert len(list(self.parameters())) == len(matrix_params) + len(embedding_params) + len(lm_head_params) + len(value_embeds_params) + len(resid_params) + len(x0_params) + len(smear_params)
+        assert len(list(self.parameters())) == len(matrix_params) + len(router_params) + len(ep_expert_params) + len(embedding_params) + len(lm_head_params) + len(value_embeds_params) + len(resid_params) + len(x0_params) + len(smear_params)
 
         # Scale the LR for the AdamW parameters by ∝1/√dmodel (tuned for 768 dim model)
         dmodel_lr_scale = (model_dim / 768) ** -0.5
@@ -399,13 +472,32 @@ class GPT(nn.Module):
             dict(kind='adamw', params=x0_params, lr=scalar_lr, betas=(0.96, 0.95), eps=1e-10, weight_decay=0.0),  # higher beta1 for x0
             dict(kind='adamw', params=smear_params, lr=0.2, betas=(0.8, 0.95), eps=1e-10, weight_decay=0.0),
         ]
+        # MoE router: AdamW, small params across layers. Keep same defaults as the matrix AdamW group below.
+        if router_params:
+            param_groups.append(dict(
+                kind='adamw', params=router_params,
+                lr=matrix_lr * dmodel_lr_scale,
+                betas=(0.8, 0.96), eps=1e-10, weight_decay=0.0,
+            ))
         # Muon groups (matrix params, grouped by shape for stacking)
         for shape in sorted({p.shape for p in matrix_params}):
             group_params = [p for p in matrix_params if p.shape == shape]
             param_groups.append(dict(
                 kind='muon', params=group_params, lr=matrix_lr,
                 momentum=0.95, ns_steps=5, beta2=0.9, weight_decay=weight_decay,
+                replicated=True,
             ))
+        # Expert Parallel routed-expert groups: each rank holds a unique slice of experts,
+        # so the optimizer must NOT reduce gradients across ranks. Muon still orthogonalizes
+        # each (D, H) slice independently via its batched polar-express (leading dims OK).
+        if ep_expert_params:
+            for shape in sorted({p.shape for p in ep_expert_params}):
+                group_params = [p for p in ep_expert_params if p.shape == shape]
+                param_groups.append(dict(
+                    kind='muon', params=group_params, lr=matrix_lr,
+                    momentum=0.95, ns_steps=5, beta2=0.9, weight_decay=weight_decay,
+                    replicated=False,
+                ))
 
         Factory = DistMuonAdamW if ddp else MuonAdamW
         optimizer = Factory(param_groups)
@@ -453,10 +545,13 @@ class GPT(nn.Module):
         n_layer = self.config.n_layer
         backout_layer = n_layer // 2  # cache at halfway point
         x_backout = None
+        # Accumulate MoE aux loss across layers (zero-valued for dense blocks).
+        aux_loss_total = torch.zeros((), device=x.device, dtype=torch.float32)
         for i, block in enumerate(self.transformer.h):
             x = self.resid_lambdas[i] * x + self.x0_lambdas[i] * x0
             ve = self.value_embeds[str(i)](idx).to(x.dtype) if str(i) in self.value_embeds else None
-            x = block(x, ve, cos_sin, self.window_sizes[i], kv_cache)
+            x, block_aux = block(x, ve, cos_sin, self.window_sizes[i], kv_cache)
+            aux_loss_total = aux_loss_total + block_aux
             if i == backout_layer:
                 x_backout = x
         # Subtract mid-layer residual to remove low-level features before logit projection
@@ -475,7 +570,8 @@ class GPT(nn.Module):
             # training: given the targets, compute and return the loss
             # TODO experiment with chunked cross-entropy?
             loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1, reduction=loss_reduction)
-            return loss
+            # Always return (ce_loss, aux_loss) pair. Caller sums them for backward and logs them separately.
+            return loss, aux_loss_total
         else:
             # inference: just return the logits directly
             return logits

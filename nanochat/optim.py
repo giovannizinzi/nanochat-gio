@@ -12,6 +12,12 @@ import torch.distributed as dist
 from torch import Tensor
 from nanochat.common import COMPUTE_DTYPE
 
+# Allow more unique shape specializations in the fused Muon/AdamW kernels. Each unique
+# (num_params, *shape) tuple triggers a specialization; MoE introduces extra shapes
+# (router, routed experts, shared experts) beyond the dense transformer's handful.
+# 64 is comfortably above what nanochat needs even with MoE at depth 26+.
+torch._dynamo.config.cache_size_limit = max(torch._dynamo.config.cache_size_limit, 64)
+
 # -----------------------------------------------------------------------------
 """
 Good old AdamW optimizer, fused kernel.
@@ -248,9 +254,15 @@ class MuonAdamW(torch.optim.Optimizer):
             state["momentum_buffer"] = torch.zeros(num_params, *shape, dtype=dtype, device=device)
         momentum_buffer = state["momentum_buffer"]
 
-        # Second momentum buffer is factored, either per-row or per-column
+        # Second momentum buffer is factored, either per-row or per-column.
+        # Generalized for params of rank >= 2: leading dims (before last 2) are preserved
+        # so each (last-2-dims) slice gets its own factored buffer. This lets Muon process
+        # 3D params like MoE expert stacks (E, D, 4D) as E independent 2D matrices.
         if "second_momentum_buffer" not in state:
-            state_shape = (num_params, shape[-2], 1) if shape[-2] >= shape[-1] else (num_params, 1, shape[-1])
+            if shape[-2] >= shape[-1]:
+                state_shape = (num_params,) + tuple(shape[:-1]) + (1,)
+            else:
+                state_shape = (num_params,) + tuple(shape[:-2]) + (1, shape[-1])
             state["second_momentum_buffer"] = torch.zeros(state_shape, dtype=dtype, device=device)
         second_momentum_buffer = state["second_momentum_buffer"]
         red_dim = -1 if shape[-2] >= shape[-1] else -2
@@ -373,13 +385,16 @@ class DistMuonAdamW(torch.optim.Optimizer):
         param_infos = {}
         for p in group['params']:
             grad = p.grad
-            if p.numel() < 1024:
-                # Small params: all_reduce (no scatter/gather needed)
+            # Use the reduce_scatter (ZeRO) path only when the param is large AND its first dim
+            # splits evenly across ranks. Otherwise fall back to all_reduce (replicated optimizer
+            # state). This is what lets MoE routers with num_experts not divisible by world_size
+            # still work — they're tiny enough that the full-replicate cost is negligible.
+            if p.numel() < 1024 or grad.shape[0] % world_size != 0:
+                # Small-or-indivisible params: all_reduce (no scatter/gather needed)
                 future = dist.all_reduce(grad, op=dist.ReduceOp.AVG, async_op=True).get_future()
                 param_infos[p] = dict(future=future, grad_slice=grad, is_small=True)
             else:
-                # Large params: reduce_scatter
-                assert grad.shape[0] % world_size == 0, f"AdamW reduce_scatter requires shape[0] ({grad.shape[0]}) divisible by world_size ({world_size})"
+                # Large params with divisible shape[0]: reduce_scatter
                 rank_size = grad.shape[0] // world_size
                 grad_slice = torch.empty_like(grad[:rank_size])
                 future = dist.reduce_scatter_tensor(grad_slice, grad, op=dist.ReduceOp.AVG, async_op=True).get_future()
@@ -466,7 +481,10 @@ class DistMuonAdamW(torch.optim.Optimizer):
         if "momentum_buffer" not in state:
             state["momentum_buffer"] = torch.zeros(chunk_size, *shape, dtype=dtype, device=device)
         if "second_momentum_buffer" not in state:
-            state_shape = (chunk_size, shape[-2], 1) if shape[-2] >= shape[-1] else (chunk_size, 1, shape[-1])
+            if shape[-2] >= shape[-1]:
+                state_shape = (chunk_size,) + tuple(shape[:-1]) + (1,)
+            else:
+                state_shape = (chunk_size,) + tuple(shape[:-2]) + (1, shape[-1])
             state["second_momentum_buffer"] = torch.zeros(state_shape, dtype=dtype, device=device)
         red_dim = -1 if shape[-2] >= shape[-1] else -2
 
@@ -506,14 +524,66 @@ class DistMuonAdamW(torch.optim.Optimizer):
                 # Muon: copy from stacked buffer back to individual params
                 torch._foreach_copy_(info["params"], list(info["stacked_params"][:len(info["params"])].unbind(0)))
 
+    def _step_muon_local(self, group: dict) -> None:
+        """Local (no-collective) Muon step for groups with replicated=False.
+
+        Used by Expert Parallel MoE where each rank owns a unique slice of experts — the
+        gradients from each rank's backward pass already reflect only the tokens that
+        routed to this rank's experts (via the reverse all_to_all), so no cross-rank
+        reduction is appropriate.
+        """
+        params = group['params']
+        if not params:
+            return
+        p = params[0]
+        shape, device, dtype = p.shape, p.device, p.dtype
+        num_params = len(params)
+
+        state = self.state[p]
+        if "momentum_buffer" not in state:
+            state["momentum_buffer"] = torch.zeros(num_params, *shape, dtype=dtype, device=device)
+        if "second_momentum_buffer" not in state:
+            if shape[-2] >= shape[-1]:
+                state_shape = (num_params,) + tuple(shape[:-1]) + (1,)
+            else:
+                state_shape = (num_params,) + tuple(shape[:-2]) + (1, shape[-1])
+            state["second_momentum_buffer"] = torch.zeros(state_shape, dtype=dtype, device=device)
+        momentum_buffer = state["momentum_buffer"]
+        second_momentum_buffer = state["second_momentum_buffer"]
+        red_dim = -1 if shape[-2] >= shape[-1] else -2
+
+        stacked_grads = torch.stack([p.grad for p in params])
+        stacked_params = torch.stack(params)
+
+        self._muon_momentum_t.fill_(group["momentum"])
+        self._muon_beta2_t.fill_(group["beta2"] if group["beta2"] is not None else 0.0)
+        self._muon_lr_t.fill_(group["lr"] * max(1.0, shape[-2] / shape[-1]) ** 0.5)
+        self._muon_wd_t.fill_(group["weight_decay"])
+        muon_step_fused(
+            stacked_grads, stacked_params, momentum_buffer, second_momentum_buffer,
+            self._muon_momentum_t, self._muon_lr_t, self._muon_wd_t, self._muon_beta2_t,
+            group["ns_steps"], red_dim,
+        )
+        torch._foreach_copy_(params, list(stacked_params.unbind(0)))
+
     @torch.no_grad()
     def step(self):
         rank = dist.get_rank()
         world_size = dist.get_world_size()
 
-        # Phase 1: launch all async reduce ops
-        reduce_infos: list[dict] = []
+        # Local-Muon groups (Expert Parallel): run fully locally, no collectives.
+        # Do this first so it overlaps with later async collectives if we ever add that.
         for group in self.param_groups:
+            if group['kind'] == 'muon' and not group.get('replicated', True):
+                self._step_muon_local(group)
+
+        # Phase 1: launch all async reduce ops (only for replicated groups)
+        reduce_infos: list = []
+        active_groups: list = []
+        for group in self.param_groups:
+            if group['kind'] == 'muon' and not group.get('replicated', True):
+                continue  # already handled above
+            active_groups.append(group)
             if group['kind'] == 'adamw':
                 reduce_infos.append(self._reduce_adamw(group, world_size))
             elif group['kind'] == 'muon':
@@ -522,8 +592,8 @@ class DistMuonAdamW(torch.optim.Optimizer):
                 raise ValueError(f"Unknown optimizer kind: {group['kind']}")
 
         # Phase 2: wait for reduces, compute updates, launch gathers
-        gather_list: list[dict] = []
-        for group, info in zip(self.param_groups, reduce_infos):
+        gather_list: list = []
+        for group, info in zip(active_groups, reduce_infos):
             if group['kind'] == 'adamw':
                 self._compute_adamw(group, info, gather_list, rank, world_size)
             elif group['kind'] == 'muon':
