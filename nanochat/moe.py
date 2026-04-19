@@ -32,6 +32,32 @@ import torch.distributed as dist
 from nanochat.common import get_dist_info
 
 
+class _AllToAllSingle(torch.autograd.Function):
+    """Autograd-enabled wrapper around dist.all_to_all_single.
+
+    `torch.distributed.all_to_all_single` is not differentiable; calling it would silently
+    break the backward graph (gradients on the expert weights would come back as None).
+    The backward of all_to_all is another all_to_all that reverses the sender/receiver
+    partitioning — so wrap both directions in a custom autograd.Function.
+    """
+
+    @staticmethod
+    def forward(ctx, x):
+        out = torch.empty_like(x)
+        dist.all_to_all_single(out, x.contiguous())
+        return out
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        grad_input = torch.empty_like(grad_output)
+        dist.all_to_all_single(grad_input, grad_output.contiguous())
+        return grad_input
+
+
+def _all_to_all_single_autograd(x):
+    return _AllToAllSingle.apply(x)
+
+
 def _round_to(x: int, multiple: int) -> int:
     return max(multiple, ((x + multiple - 1) // multiple) * multiple)
 
@@ -207,11 +233,10 @@ class MoE(nn.Module):
             x_flat[sorted_tok] * keep.unsqueeze(-1),
         )
 
-        # All-to-all: after this call, this rank has received chunks from every sender,
-        # each chunk of size (E_per_rank * capacity, D). Layout on receiver:
-        #   recv[sender * E_per_rank * capacity : (sender+1) * E_per_rank * capacity]
-        recv_buffer = torch.empty_like(send_buffer)
-        dist.all_to_all_single(recv_buffer, send_buffer)
+        # All-to-all (differentiable): after this call, this rank has received chunks from
+        # every sender, each of size (E_per_rank * capacity, D). Backward is another
+        # all_to_all that returns gradients to the original sender ranks.
+        recv_buffer = _all_to_all_single_autograd(send_buffer)
 
         # Reshape to (ws, E_per_rank, capacity, D), transpose to (E_per_rank, ws, cap, D),
         # then flatten the (ws, cap) dims so each local expert sees ws*capacity tokens.
@@ -229,8 +254,7 @@ class MoE(nn.Module):
         return_buffer = local_outputs.view(Ep, ws, capacity, D).transpose(0, 1).contiguous()
         return_buffer = return_buffer.view(ws * Ep * capacity, D)
 
-        back_buffer = torch.empty_like(return_buffer)
-        dist.all_to_all_single(back_buffer, return_buffer)
+        back_buffer = _all_to_all_single_autograd(return_buffer)
         # back_buffer layout matches the original send_buffer layout: (E * capacity, D).
 
         # Combine: gather outputs back to each token's position, weighted by its gate prob.
