@@ -192,6 +192,93 @@ class _Float8Matmul(torch.autograd.Function):
         return grad_input, grad_weight
 
 
+# =============================================================================
+# MoE routed-expert FP8 path
+# =============================================================================
+#
+# MoE routed experts are 3D nn.Parameters of shape (E, K, N) — one (K, N) weight
+# slice per expert — so they can't use Float8Linear (which wraps nn.Linear 2D weights).
+#
+# For dense: output = input @ weight (shape (M, K) @ (K, N) per expert).
+# We quantize input and weight to FP8 per-expert (tensorwise) and call
+# torch._scaled_mm once per expert. Python loop over E experts adds overhead
+# but the per-expert GEMM is large enough (M >> E·D·H stride) that the FP8
+# matmul still wins on wall-clock compared to bf16 bmm.
+#
+# If torch._scaled_grouped_mm becomes available/stable with the same per-group
+# scaling semantics, this can be rewritten to eliminate the Python loop.
+
+@torch._dynamo.allow_in_graph
+class _Float8MatmulDirect(torch.autograd.Function):
+    """FP8 matmul: output = input @ weight (no transpose).
+
+    Shapes:
+      input:  (M, K)   — row-major
+      weight: (K, N)   — will be converted to col-major internally for _scaled_mm
+      output: (M, N)
+
+    Same three FP8 GEMMs as _Float8Matmul, but the weight is (K, N) rather than
+    (N, K) — so the forward uses `_to_col_major(weight)` instead of `weight.t()`.
+    """
+
+    @staticmethod
+    def forward(ctx, input, weight):
+        input_fp8, input_inv = _to_fp8(input, torch.float8_e4m3fn)
+        weight_fp8, weight_inv = _to_fp8(weight, torch.float8_e4m3fn)
+        ctx.save_for_backward(input_fp8, input_inv, weight_fp8, weight_inv)
+        # input (M, K) row-major — good for first arg of _scaled_mm
+        # weight (K, N) — need col-major for second arg
+        weight_col = _to_col_major(weight_fp8)
+        output = torch._scaled_mm(
+            input_fp8, weight_col,
+            scale_a=input_inv, scale_b=weight_inv,
+            out_dtype=input.dtype, use_fast_accum=True,
+        )
+        return output
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        in_fp8, in_inv, w_fp8, w_inv = ctx.saved_tensors
+        # grad_input = grad_output @ weight.T  : (M, N) @ (N, K) -> (M, K)
+        go_fp8, go_inv = _to_fp8(grad_output, torch.float8_e5m2)
+        # go_fp8 (M, N) row-major — good for first arg
+        # w_fp8 (K, N) row-major; w_fp8.t() is (N, K) with strides (1, K) = col-major. Good.
+        grad_input = torch._scaled_mm(
+            go_fp8, w_fp8.t(),
+            scale_a=go_inv, scale_b=w_inv,
+            out_dtype=grad_output.dtype, use_fast_accum=False,
+        )
+        # grad_weight = input.T @ grad_output : (K, M) @ (M, N) -> (K, N)
+        in_T = in_fp8.t().contiguous()    # (K, M) row-major
+        go_col = _to_col_major(go_fp8)    # (M, N) col-major
+        grad_weight = torch._scaled_mm(
+            in_T, go_col,
+            scale_a=in_inv, scale_b=go_inv,
+            out_dtype=grad_output.dtype, use_fast_accum=False,
+        )
+        return grad_input, grad_weight
+
+
+def fp8_expert_bmm(act_3d, weight_3d):
+    """FP8 per-expert batched matmul: act (E, M, K) @ weight (E, K, N) -> out (E, M, N).
+
+    Each expert is its own independent FP8 matmul with its own tensorwise scales.
+    Implemented as a Python for-loop over experts; each iteration calls the 3-GEMM
+    FP8 autograd path from `_Float8MatmulDirect`. The Python loop overhead is
+    usually negligible compared to the per-expert matmul (M * K * N ~ millions of
+    ops) so this is approximately as fast as a true fused grouped matmul would be,
+    minus kernel launch overhead.
+    """
+    E = act_3d.shape[0]
+    outputs = []
+    for e in range(E):
+        act_e = act_3d[e].contiguous()      # (M, K) row-major
+        w_e = weight_3d[e].contiguous()      # (K, N) row-major
+        out_e = _Float8MatmulDirect.apply(act_e, w_e)
+        outputs.append(out_e)
+    return torch.stack(outputs, dim=0)
+
+
 class Float8Linear(nn.Linear):
     """Drop-in nn.Linear replacement that does FP8 compute.
 

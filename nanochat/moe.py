@@ -105,6 +105,9 @@ class MoE(nn.Module):
             self.expert_parallel = False
             self.E_per_rank = self.num_experts
 
+        # FP8 for routed-expert matmuls (independent of --fp8 which handles nn.Linear only).
+        self.moe_expert_fp8 = bool(getattr(config, "moe_expert_fp8", False))
+
         # Router: replicated across ranks (decision must be consistent globally).
         self.router_weight = nn.Parameter(torch.empty(self.num_experts, self.n_embd))
 
@@ -178,9 +181,16 @@ class MoE(nn.Module):
 
         w_fc = self.w_fc.to(x_flat.dtype)
         w_proj = self.w_proj.to(x_flat.dtype)
-        hidden = torch.bmm(expert_inputs, w_fc)
-        hidden = F.relu(hidden).square()
-        expert_output = torch.bmm(hidden, w_proj)
+        if self.moe_expert_fp8:
+            # Lazy import to avoid circular deps at module load time.
+            from nanochat.fp8 import fp8_expert_bmm
+            hidden = fp8_expert_bmm(expert_inputs, w_fc)
+            hidden = F.relu(hidden).square()
+            expert_output = fp8_expert_bmm(hidden, w_proj)
+        else:
+            hidden = torch.bmm(expert_inputs, w_fc)
+            hidden = F.relu(hidden).square()
+            expert_output = torch.bmm(hidden, w_proj)
 
         expert_output_flat = expert_output.view(E * capacity, D)
         gathered = expert_output_flat[flat_scatter_idx]

@@ -46,6 +46,7 @@ class GPTConfig:
     moe_aux_loss_coef: float = 0.01
     expert_hidden_dim: int = -1  # -1 = auto (compute-matched to dense active FFN)
     expert_parallel: bool = False  # if True (+ num_experts % world_size == 0), shard experts across GPUs
+    moe_expert_fp8: bool = False   # if True, use FP8 matmuls for routed expert bmm (per-expert tensorwise scaling)
 
 
 def norm(x):
