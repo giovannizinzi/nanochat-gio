@@ -842,15 +842,92 @@ Also of note: **MFU at d22 is 43%** — our best MFU ever, up from 24–35% at d
 
 Karpathy's reported dense d26 speedrun (on his branch with FP8): **~180 min for CORE ~0.256**. Our MoE hit 0.276 in 145 min — prima-facie faster and higher. But his run is on a different codebase with different optimizations (FP8, etc). **Need to verify on *our* codebase** with a dense d26 run.
 
-### P16 — dense d26 on our codebase (verification, in flight)
+### P16 — dense d26 verification (our codebase)
 
-Running dense d26 with the same 6000 iters, device_batch_size=16, core_metric_every=2000. This is the head-to-head comparison. Expected step time ~800–1000 ms (d26 dense without MoE dispatch overhead), so total ~90–120 min. CORE intermediate evals will show when it crosses 0.2565.
+| Metric | Dense d26 @ 6000 | MoE d22 E=4 h=4096 aux=0.05 @ 6000 |
+|---|---:|---:|
+| Wall-clock | **160.32 min** | 145.25 min |
+| Peak VRAM | 71.9 GiB | 75.6 GiB |
+| MFU | ~49.5% | 43.0% |
+| Final val_bpb | 0.7087 | 0.7103 |
+| Final CORE | 0.2672 | **0.2767** |
+| CORE @ step 2000 | **0.2053** | 0.1972 |
+| CORE @ step 4000 | **0.2641** | 0.2407 |
 
-**The verdict criterion:**
-- If dense d26 reaches CORE 0.2565 **in less than 145 min**, MoE is NOT faster on our codebase — Karpathy's 180-min figure is slower than his branch can actually do with current optimizations.
-- If dense d26 takes **more than 145 min** to reach CORE 0.2565 (or doesn't reach it in 6000 iters), then **MoE wins the "time to GPT-2 CORE" race on our codebase**.
+**Time-to-GPT-2-CORE-0.2565 (interpolated between intermediate evals):**
 
-*Result TBD.*
+| Config | Est. time to CORE 0.2565 |
+|---|---:|
+| **Dense d26 @ 6000** | **~100 min** |
+| MoE d22 replicated @ 6000 | ~117 min |
+
+**Dense wins time-to-GPT-2 by ~17 min on our codebase.** MoE's per-step loss improvement doesn't materialize fast enough to overcome dense's higher MFU and better per-step CORE at d26.
+
+**However**, MoE d22 *caught up and surpassed* dense d26 on final CORE (0.277 vs 0.267) by the end of the 6000 iters. The crossover point is beyond where dense tops out. This matches the earlier pattern: MoE's capacity advantage compounds, but only after enough training.
+
+The Karpathy-reported 180-min speedrun number includes FP8, which our implementation can't use with MoE. Without that asymmetry, dense on our codebase is actually *faster* than his reported number (160 min vs 180 min), and MoE d22 can't beat it.
+
+### Phase 3 verdict (replicated MoE) — dense still wins time-to-GPT-2-CORE
+
+With the best replicated-MoE config we can fit (d22 E=4 h=4096 due to VRAM), MoE cannot beat dense at matched wall-clock for hitting GPT-2-scale CORE. Primary cause: **replicated MoE caps out at d22** because expert weights × world_size × fp32 + muon state exceeds 80 GB per H100 at higher depth.
+
+Attack plan: **Expert Parallelism** so the memory cost of experts scales as O(1/world_size) per GPU.
+
+### P17 — Expert Parallel MoE at d26 (in flight)
+
+New `--expert-parallel` flag. Requires `num_experts % world_size == 0`, so we bump to E=8 (previous best at d22 was E=4). Each GPU hosts 1 expert. Routing uses two `all_to_all_single` collectives per forward:
+1. After local dispatch, send each expert's slot-chunk to the rank hosting that expert.
+2. After local expert forward, send outputs back to origin ranks.
+
+Optimizer: expert weights are now rank-local, so the new `replicated=False` Muon group bypasses reduce_scatter/all_gather (each rank has different weights with different gradients — cross-rank reduction would be wrong).
+
+Target: **beat dense d26's 100-min time-to-GPT-2-CORE**.
+
+Expected memory at EP d26 E=8 h=4096:
+- Per-rank routed expert params: 1 expert × 2 × 1664 × 4096 × 26 ≈ 354M → 1.4 GB per rank (vs 11 GB replicated)
+- Shared expert: 354M → 1.4 GB (still replicated)
+- Dense d26 base: 800M → 3.2 GB
+- Activations + NCCL buffers at device_batch=16: est 15–20 GB
+- **Total: ~25–30 GB per rank** → tons of headroom, could go deeper.
+
+Expected throughput:
+- `all_to_all_single` roundtrip at 8 GPUs: ~5 ms for the sizes we have
+- 2 roundtrips × 26 layers = 52 collectives per forward + 52 per backward ≈ 0.5 s overhead per step
+- Plus local expert matmul (now on tokens from all 8 ranks, so bigger matmul = higher MFU)
+- Estimate: step time similar to replicated MoE d22 (1.45 s) — maybe slightly faster because of less memory pressure
+
+### EP debugging journey (worth documenting)
+
+Getting EP to actually run took 4 iteration-cycles, each catching a different bug:
+
+1. **`AssertionError` in param-count sanity check** — `setup_optimizer` asserts that `len(self.parameters())` equals the sum of its group-by-group tallies. Adding `ep_expert_params` as a separate list without including it in the sum tripped the check. Fix: include it.
+2. **`active_total = -665,890,758` (negative!)** — `num_scaling_params` subtracts an "inactive experts" count from `transformer_matrices`. Under EP, local `transformer_matrices` is already missing the non-local experts, so subtracting again yields nonsense. Fix: add back the non-local routed params to recover a *global* view, then subtract inactive consistently.
+3. **`TypeError: expected Tensor, got NoneType`** in the Muon step — expert weight grads came back `None`. Root cause: `dist.all_to_all_single` is **not differentiable**; the backward graph was cut at the collective, so gradients never reached the expert weights. Fix: custom `torch.autograd.Function` that calls all_to_all in backward too.
+4. **OOM at device_batch=16** — with the autograd ctx capturing the pre-collective input tensor, memory pressure pushed us over 80 GB at h=4096. Fix: drop to h=3072 (compute-matched for d26 top_k=1+shared=1) or reduce batch size.
+5. **`c10::DistBackendError` on CORE eval** — the intermediate CORE eval routes variable-shape batches through different ranks. EP's all_to_all requires matching tensor sizes across ranks; with variable-per-rank batches the collective mismatches and NCCL throws. Workaround for now: `--core-metric-every=999999` so eval only fires at end. Proper fix: pad CORE inputs to a common shape across ranks before forward.
+
+### P17 result — MoE d26 E=8 k=1 h=3072 cf=1.0 aux=0.05 **+ EP** @ 6000 iters (in flight)
+
+Running at `device_batch=16`, `--core-metric-every=999999` (only eval at end, to avoid the EP-on-variable-shape CORE-eval deadlock).
+
+Step time: **1.83 s** (vs dense d26's 1.6 s at same bs=16). EP adds ~14% overhead per step from 26 layers × 2 all_to_all × 2 (forward+backward) = 104 collectives per step.
+
+ETA to step 6000: ~180 min. Final CORE TBD (if the step-6000 eval survives, it'll tell us whether EP+d26 beats MoE-d22's 0.2767 without the FP8 asymmetry problem).
+
+### Preliminary take on EP
+
+EP successfully saved memory (fits E=8 at d26 without OOM vs replicated mode which OOM'd even at d24). But it added wall-clock overhead:
+- Dense d26 @ 6000 iters: 160 min
+- MoE d22 replicated E=4 h=4096 @ 6000 iters: 145 min
+- MoE d26 EP E=8 h=3072 @ 6000 iters (projected): ~180 min
+
+So EP at d26 is slower than both alternatives wall-clock. The only chance MoE EP still wins is if it reaches CORE 0.2565 *earlier in the training trajectory* (i.e., by step ~3000–4000) than dense d26 does (~3700). Given MoE d22 replicated's slower CORE curve early on, this seems unlikely — but worth running.
+
+Next ideas if EP at d26 also loses:
+- **h=4096** (bigger experts, maybe worth even more wall-clock if quality improves enough).
+- **E=16 k=1** with EP (2 experts per rank, finer-grained specialization at same total active compute).
+- **Pad CORE inputs** to fix the intermediate-eval deadlock so we can track CORE trajectory.
+- **Fused FlashMoE kernel** — the remaining big lever; would kill the 14% EP overhead.
 
 ### Realistic forecast on the GPT-2 CORE challenge
 
