@@ -794,6 +794,55 @@ Each change moved MoE closer to dense; together they got MoE to "tie within nois
 
 **P14: MoE d16 E=4 h=4096 cf=1.0 + aux=0.05 @ 3000 iters** — applying the "free +4 CORE" aux trick (from P13 at d12) to our best d16 config. If it lifts CORE by similar 4 mb at d16, MoE pushes to CORE ~0.196 at ~19 min, getting back in contention with dense d16 @ 5000 (0.197). Tightest matched comparison yet.
 
+---
+
+## Phase 3: Chase GPT-2 CORE (0.2565) with MoE
+
+Goal: reach CORE ≥ **0.2565** (GPT-2 1.6B level) with MoE, faster than dense.
+
+Karpathy reference: dense d26 speedrun (with FP8) reaches CORE ~0.257 in ~3 hrs on 8×H100 (~$72).
+
+### Scaling our best config up
+
+Best MoE config identified: **E=4 k=1 h=4096 cf=1.0 aux=0.05** (router on AdamW). Needed to scale to depths d22+ to have a chance at 0.2565.
+
+Memory hit at d26 and d24 (OOM even at device_batch=16). Root cause: fully-replicated expert weights. At d24 E=4 h=4096:
+- Routed expert params: 4 × 2 × 1536 × 4096 × 24 = 1.21B
+- Shared expert: 0.30B
+- Total expert params: 1.51B
+- With fp32 master + muon momentum + bf16 copies + grads ≈ 4× bytes = **24 GB per GPU just for experts**
+- Plus dense d24 base (~550M params × 4 bytes = 2.2 GB)
+- Plus activations at device_batch=16 (bigger at d24): ~15–20 GB
+- **Total: too close to 80 GB to leave headroom for torch.compile + NCCL buffers.**
+
+Settled on **d22** as the max depth that fits. Active_total at d22 E=4 h=4096 = 1.28B (vs 286M at dense d12). Fits ~50 GB per GPU.
+
+### P15 — MoE d22 E=4 k=1 h=4096 cf=1.0 aux=0.05 @ 6000 iters (in flight)
+
+First data point (step 2000 CORE = 0.1972) is already at the level our dense d16 @ 5000 reached at 19 min. But at d22 step time is 1.45 s (vs ~200 ms at d12) — total training time for 6000 iters ≈ 2.5 hrs.
+
+Also of note: **MFU at d22 is 43%** — our best MFU ever, up from 24–35% at d12/d16. Bigger per-expert matmuls actually saturate H100 tensor cores properly. The throughput side of MoE only starts to look good at ≥d22.
+
+*Expected: CORE final around 0.22–0.23 at 6000 iters (under-trained — compute-optimal at d22 would be ~11000 iters). Will update.*
+
+### Realistic forecast on the GPT-2 CORE challenge
+
+Given everything we've learned:
+- Best-case MoE at **matched wall-clock** beats dense by ≤1% val_bpb and ties-or-loses CORE.
+- Our implementation cannot use FP8 for routed experts. Karpathy's dense speedrun does use FP8. So dense has a ~10–20% wall-clock advantage we can't match.
+- At d22 and above, MoE's MFU becomes competitive with dense (~43% vs dense's ~45–50% with FP8). But the dispatch overhead doesn't fully go away.
+- At longer training (multi-hour), MoE's val_bpb advantage compounds but CORE stays noisy.
+
+**Honest prediction**: MoE with this implementation will not beat dense at time-to-CORE-0.2565. The path to a decisive win almost certainly requires (in order of importance):
+1. **Expert parallelism** — shard experts across GPUs so memory use scales as O(1/world_size) instead of O(1) per GPU. Would let us fit MoE at d26 trivially and remove a lot of the "dense has more room for bigger batch" advantage.
+2. **Fused FlashMoE-style kernel** — collapse dispatch + expert matmul + combine into one kernel call. Would recover the ~10 pp MFU gap.
+3. **FP8 for routed experts** — either via `torch._scaled_grouped_mm` (unstable) or custom autograd.
+
+None of these are doable in our 20-min-per-experiment iteration loop.
+
+We'll let P15 complete for the scaling-law data point, then document the verdict.
+
+
 
 ## Analysis framework (how we'll answer "did MoE win?")
 
