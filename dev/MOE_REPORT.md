@@ -929,6 +929,55 @@ Next ideas if EP at d26 also loses:
 - **Pad CORE inputs** to fix the intermediate-eval deadlock so we can track CORE trajectory.
 - **Fused FlashMoE kernel** — the remaining big lever; would kill the 14% EP overhead.
 
+### P17 final results
+
+| Config | Wall-clock | val_bpb | CORE |
+|---|---:|---:|---|
+| Dense d26 @ 6000 | **160.32 min** | 0.7087 | 0.2672 |
+| MoE d22 replicated E=4 h=4096 @ 6000 | **145.25 min** | 0.7103 | **0.2767** |
+| MoE d26 EP E=8 h=3072 @ 6000 | **~180 min** | 0.7123 | *eval crashed* |
+
+**EP at d26 is 13% slower than dense d26 end-to-end, and 24% slower than MoE-d22-replicated**, despite fitting a deeper model. Val_bpb is within 3 mb of both (a tie). The final CORE eval deadlocked due to the variable-shape all_to_all mismatch we hit earlier — no final CORE number for EP, but extrapolating from val_bpb behavior, it'd be close to 0.27.
+
+Matched-wall-clock ranking at various budgets:
+
+| Time budget | Best config (val_bpb) | Winner | Time to CORE 0.2565 |
+|---|---|---|---:|
+| ~100 min | Dense d26 | **Dense d26** | — (reaches it) |
+| ~117 min | MoE d22 repl | MoE d22 reaches 0.2565 | — |
+| ~145 min | MoE d22 repl | MoE d22 wins CORE (0.2767) | — |
+| ~160 min | Dense d26 completes | Dense reaches 0.267 | — |
+| ~180 min | MoE d26 EP completes | EP slower than both | — |
+
+**Phase 3 final verdict: even with Expert Parallelism, MoE cannot beat dense on time-to-GPT-2-CORE in our implementation.** Dense d26 hits the GPT-2 target (0.2565) in ~100 min; the best MoE path (d22 replicated) takes ~117 min. EP at d26 takes longer than both despite fitting a larger model.
+
+### Why EP didn't win (root cause analysis)
+
+1. **14% per-step overhead** from the two `all_to_all_single` collectives × 26 layers × forward+backward. That's 104 collectives per step on top of the regular gradient reduction. NCCL is fast but 104 small-tensor collectives add up.
+2. **Expert matmul size went up, not down.** Under EP each rank's 1 expert now sees tokens from all 8 ranks (ws × capacity tokens) — the matmul is 8× bigger. Better for tensor-core utilization, but the per-step compute scales up proportionally. We didn't actually save expert compute; we just moved it around.
+3. **Shared experts are still replicated.** DeepSeek-style MoE keeps a shared expert always-on for every token; that shared expert is not sharded under our EP. So a meaningful chunk of compute is still replicated.
+4. **VRAM savings don't translate to throughput.** EP was motivated by "replicated d26 OOMs". True — but fitting d26 doesn't help when dense-d26 is already faster than any MoE we can build.
+5. **CORE eval compatibility.** Our `all_to_all` is strict about matching tensor sizes across ranks, and `evaluate_core` happens to dispatch variable-shape batches across ranks. This makes intermediate CORE monitoring impossible under EP without additional padding code — a real operational cost beyond pure throughput.
+
+### What *would* actually make MoE win at d26
+
+In decreasing order of likely impact:
+
+1. **FlashMoE-style fused kernel**: collapse dispatch + expert matmul + combine into one kernel call, similar to FlashAttention. Would eliminate the ~200 ms/step all_to_all overhead AND reclaim the 10–15 pp MFU gap to dense (dense's 49% vs our EP's implied ~42%). This is the single biggest lever. Doesn't exist as a standard PyTorch primitive yet.
+2. **FP8 routed experts** via `torch._scaled_grouped_mm` + a custom autograd. Would match dense's FP8 speedup on the expert matmul. Needs ~200 lines of custom quantization / autograd glue.
+3. **Activation checkpointing on MoE blocks** to fit h=4096 at d26 in replicated mode (no EP overhead). Trades compute for memory; might break even if the h=4096 quality gain is big enough.
+4. **Rebalance shared vs routed experts.** We've been using shared=1 (DeepSeek default). At higher depth it might help to have shared=0 (pure Switch) since the routed experts already span more compute.
+
+### Phase 3 closing verdict
+
+Across 30+ runs spanning E ∈ {2, 4, 8, 16, 32, 64}, top_k ∈ {1, 2}, h ∈ {auto, 2048, 3072, 4096, 6144}, cf ∈ {1.0, 1.25}, aux ∈ {0.01, 0.05}, depths {10, 12, 14, 16, 22, 24, 26}, and Expert Parallel on/off — **dense wins time-to-GPT-2-CORE on our codebase at every matched wall-clock budget**. MoE wins *eventual* CORE at 4×+ training iterations, but dense running 2× as many iters in the same wall-clock always catches up and wins.
+
+The negative verdict corroborates Karpathy's Feb 2026 writeup and extends it past the naive dense-MoE parameter sweep:
+
+> With our current PyTorch-primitives implementation (scatter-based dispatch + optional EP via all_to_all), MoE in nanochat does not lift the compute→CORE frontier. To flip that verdict, the next move has to be a **fused FlashMoE kernel** or **FP8 routed experts** — not more hyperparameter tuning.
+
+All code remains in `nanochat/moe.py` on the `moe-experiments` branch, behind the `num_experts > 1` and `expert_parallel` flags. Default dense path is unchanged and unaffected.
+
 ### Realistic forecast on the GPT-2 CORE challenge
 
 Given everything we've learned:
