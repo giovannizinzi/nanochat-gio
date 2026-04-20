@@ -62,6 +62,7 @@ parser.add_argument("--expert-hidden-dim", type=int, default=-1, help="per-exper
 parser.add_argument("--expert-parallel", action="store_true", help="shard routed experts across GPUs via all_to_all_single (requires num_experts % world_size == 0)")
 parser.add_argument("--moe-expert-fp8", action="store_true", help="use FP8 matmul for routed expert bmm (per-expert tensorwise scaling)")
 parser.add_argument("--moe-first-layer", type=int, default=0, help="layers [0, moe-first-layer) stay dense; [moe-first-layer, n_layer) are MoE. 1 = '1dense+SE' (arxiv 2506.12119)")
+parser.add_argument("--max-train-shards", type=int, default=-1, help="cap training parquet shards to first N (enables data reuse / multi-epoch training; arxiv 2506.12119 §6)")
 # Training horizon (only one used, in order of precedence)
 parser.add_argument("--num-iterations", type=int, default=-1, help="explicit number of optimization steps (-1 = disable)")
 parser.add_argument("--target-flops", type=float, default=-1.0, help="calculate num_iterations to reach target_flops (-1 = disable)")
@@ -348,7 +349,7 @@ if scaler is not None:
 # -----------------------------------------------------------------------------
 # Initialize the DataLoaders for train/val
 dataloader_resume_state_dict = None if not resuming else meta_data["dataloader_state_dict"]
-train_loader = tokenizing_distributed_data_loader_with_state_bos_bestfit(tokenizer, args.device_batch_size, args.max_seq_len, split="train", device=device, resume_state_dict=dataloader_resume_state_dict)
+train_loader = tokenizing_distributed_data_loader_with_state_bos_bestfit(tokenizer, args.device_batch_size, args.max_seq_len, split="train", device=device, resume_state_dict=dataloader_resume_state_dict, max_train_shards=args.max_train_shards)
 build_val_loader = lambda: tokenizing_distributed_data_loader_bos_bestfit(tokenizer, args.device_batch_size, args.max_seq_len, split="val", device=device)
 x, y, dataloader_state_dict = next(train_loader) # kick off load of the very first batch of data
 
