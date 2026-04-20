@@ -30,6 +30,22 @@ Compute: ~330ms/step at d12 × 1500 iters = ~8 min/experiment. CORE at d12 is no
 
 Striking val_bpb ↔ CORE decoupling: MoE compresses bits better but dense generalizes better to downstream tasks. At our scale, the router's specialization benefit for training data distribution hurts CORE. **Dense d22 FP8 is the real baseline to beat, not the earlier d26 number — and MoE still loses at matched depth & compute.**
 
+## BREAKTHROUGH: shared=3 helps (v74, 1500 iter)
+
+Tested the "router over-specialization hurts CORE" hypothesis by raising shared experts
+from 1 → 3 (compute-matched via halving Dₑ 4096 → 2048):
+
+| config | val_bpb | CORE | vs dense d22 |
+|---|---|---|---|
+| dense d22 FP8 | 0.791 | 0.1969 | baseline |
+| MoE E=4 K=1 sh=1 Dₑ=4096 | 0.780 | 0.1971 | +0.0002 (tie) |
+| **MoE E=4 K=1 sh=3 Dₑ=2048** | **0.781** | **0.2090** | **+0.0121** |
+
+**val_bpb unchanged (0.781 vs 0.780), but CORE jumped +0.012.** This is the first config
+that separates val_bpb from CORE in MoE's favor — suggests shared experts carry general
+knowledge that routed experts can't (routed specialize too narrowly). Scaling to 6000
+iter as v75.
+
 ## What might still work (untested or inconclusive)
 
 - **MoE with more iterations than dense at same wall-clock**: dense d22 finishes 6000 iter in 88 min; MoE d22 could run 6000 iter at 142 min but MoE per-step CORE-per-iter scales differently. Running MoE longer than matched-iter (e.g. 10k iter to match dense 6k wall-clock) might flip it. Untested.
