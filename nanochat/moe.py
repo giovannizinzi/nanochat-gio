@@ -119,6 +119,10 @@ class MoE(nn.Module):
         # loads balanced. When enabled, aux_loss_coef ≈ 0 is the paper-recommended setup.
         self.moe_auxfree_bias = bool(getattr(config, "moe_auxfree_bias", False))
         self.moe_auxfree_bias_lr = float(getattr(config, "moe_auxfree_bias_lr", 1e-3))
+        # Scale applied to gate probabilities before combining expert outputs. DeepSeek-V3
+        # uses 2.827 (≈sqrt(K·E/top_k)·const, empirically tuned). Kimi K2/K2.6 same.
+        # Default 1.0 preserves existing behavior.
+        self.moe_routed_scaling = float(getattr(config, "moe_routed_scaling", 1.0))
         if self.moe_auxfree_bias:
             # Non-learnable (register_buffer) so optimizer doesn't touch it; updated manually.
             self.register_buffer("expert_bias", torch.zeros(self.num_experts), persistent=True)
@@ -383,6 +387,9 @@ class MoE(nn.Module):
             else:
                 topk_probs_f, topk_idx = routing_probs.topk(k, dim=-1)
             topk_probs_f = topk_probs_f / (topk_probs_f.sum(dim=-1, keepdim=True) + 1e-9)
+            # Scale gate probabilities (DeepSeek-V3 "routed_scaling_factor", default 1.0).
+            if self.moe_routed_scaling != 1.0:
+                topk_probs_f = topk_probs_f * self.moe_routed_scaling
             topk_probs = topk_probs_f.to(x.dtype)
 
             if self.moe_auxfree_bias:

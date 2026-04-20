@@ -57,6 +57,8 @@ class GPTConfig:
     # each step by sign(avg_load − load_e). Replaces Switch aux loss without gradient noise.
     moe_auxfree_bias: bool = False
     moe_auxfree_bias_lr: float = 1e-3
+    # Gate-prob scale before combining expert outputs (DeepSeek-V3: 2.827).
+    moe_routed_scaling: float = 1.0
 
 
 def norm(x):

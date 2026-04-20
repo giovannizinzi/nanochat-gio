@@ -65,6 +65,7 @@ parser.add_argument("--moe-first-layer", type=int, default=0, help="layers [0, m
 parser.add_argument("--moe-expert-choice", action="store_true", help="expert-choice routing (Zhou 2022 NeurIPS): experts pick top-C tokens. No aux loss, no drops.")
 parser.add_argument("--moe-auxfree-bias", action="store_true", help="aux-loss-free load balancing (DeepSeek-V3, arxiv 2408.15664). Replaces --moe-aux-loss-coef.")
 parser.add_argument("--moe-auxfree-bias-lr", type=float, default=1e-3, help="bias update rate for aux-loss-free balancing")
+parser.add_argument("--moe-routed-scaling", type=float, default=1.0, help="scale applied to gate probabilities before combining expert outputs (DeepSeek-V3: 2.827)")
 parser.add_argument("--max-train-shards", type=int, default=-1, help="cap training parquet shards to first N (enables data reuse / multi-epoch training; arxiv 2506.12119 §6)")
 # Training horizon (only one used, in order of precedence)
 parser.add_argument("--num-iterations", type=int, default=-1, help="explicit number of optimization steps (-1 = disable)")
@@ -162,6 +163,7 @@ def build_model_meta(depth):
         moe_expert_choice=args.moe_expert_choice,
         moe_auxfree_bias=args.moe_auxfree_bias,
         moe_auxfree_bias_lr=args.moe_auxfree_bias_lr,
+        moe_routed_scaling=args.moe_routed_scaling,
     )
     with torch.device("meta"):
         model_meta = GPT(config)
