@@ -59,6 +59,9 @@ class GPTConfig:
     moe_auxfree_bias_lr: float = 1e-3
     # Gate-prob scale before combining expert outputs (DeepSeek-V3: 2.827).
     moe_routed_scaling: float = 1.0
+    # ScatterMoE Triton kernels (Tan et al. 2024) — drop-in replacement for the replicated
+    # dispatch+bmm+combine path. Saves VRAM (no padded dispatch buffer) and keeps MFU at E>=16.
+    moe_scattermoe: bool = False
 
 
 def norm(x):

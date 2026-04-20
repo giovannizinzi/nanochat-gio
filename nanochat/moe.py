@@ -123,6 +123,10 @@ class MoE(nn.Module):
         # uses 2.827 (≈sqrt(K·E/top_k)·const, empirically tuned). Kimi K2/K2.6 same.
         # Default 1.0 preserves existing behavior.
         self.moe_routed_scaling = float(getattr(config, "moe_routed_scaling", 1.0))
+        # ScatterMoE Triton kernels (Tan et al. 2024) for E>=16 where cuBLAS grouped-bmm
+        # falls off tensor-core efficiency. Replaces the dispatch + bmm + combine pipeline
+        # with two scatter-to-scatter Triton calls. Reports 50%+ MFU on H100 at fine-grain.
+        self.moe_scattermoe = bool(getattr(config, "moe_scattermoe", False))
         if self.moe_auxfree_bias:
             # Non-learnable (register_buffer) so optimizer doesn't touch it; updated manually.
             self.register_buffer("expert_bias", torch.zeros(self.num_experts), persistent=True)
@@ -166,6 +170,38 @@ class MoE(nn.Module):
         if self.ws_fc is not None:
             torch.nn.init.uniform_(self.ws_fc, -s * 0.4, s * 0.4)
             torch.nn.init.zeros_(self.ws_proj)
+
+    # -------------------------------------------------------------------------
+    # Forward — ScatterMoE Triton kernel (Tan et al. 2024).
+    # Replaces dispatch + torch.bmm + combine with two scatter-to-scatter calls.
+    # No padded-capacity buffer: ScatterMoE handles variable per-expert counts in-kernel.
+    # Critical for E>=16 where cuBLAS grouped-bmm underutilizes tensor cores.
+    # -------------------------------------------------------------------------
+    def _forward_scattermoe(self, x_flat, topk_probs, topk_idx, N, E, k, D):
+        from nanochat.kernels.scattermoe.parallel_experts import parallel_linear, flatten_sort_count
+
+        sorted_expert_idxs, sorted_scattered_idxs, expert_offsets = flatten_sort_count(
+            topk_idx, num_experts=E
+        )
+
+        w_fc = self.w_fc.to(x_flat.dtype)       # (E, D, H)
+        w_proj = self.w_proj.to(x_flat.dtype)   # (E, H, D)
+
+        # GEMM 1: tokens × w_fc, keeping output in grouped (sorted) order.
+        h = parallel_linear(
+            x_flat, w_fc, k,
+            sorted_expert_idxs, sorted_scattered_idxs, expert_offsets,
+            grouped_out=True,
+        )
+        h = F.relu(h).square()
+
+        # GEMM 2: grouped input × w_proj, combine via gate probs → (N, D).
+        routed_out = parallel_linear(
+            h, w_proj, 1,
+            sorted_expert_idxs, sorted_scattered_idxs, expert_offsets,
+            grouped_in=True, gates=topk_probs,
+        )
+        return routed_out
 
     # -------------------------------------------------------------------------
     # Forward — expert-choice routing (experts pick tokens instead of tokens pick experts).
@@ -410,6 +446,8 @@ class MoE(nn.Module):
 
             if self.expert_parallel:
                 routed_out = self._forward_ep(x_flat, topk_probs, topk_idx, N, E, k, D)
+            elif self.moe_scattermoe:
+                routed_out = self._forward_scattermoe(x_flat, topk_probs, topk_idx, N, E, k, D)
             else:
                 routed_out = self._forward_replicated(x_flat, topk_probs, topk_idx, N, E, k, D)
 
