@@ -61,6 +61,7 @@ parser.add_argument("--moe-aux-loss-coef", type=float, default=0.01, help="Switc
 parser.add_argument("--expert-hidden-dim", type=int, default=-1, help="per-expert FFN hidden dim (-1 = auto, compute-matched to dense)")
 parser.add_argument("--expert-parallel", action="store_true", help="shard routed experts across GPUs via all_to_all_single (requires num_experts % world_size == 0)")
 parser.add_argument("--moe-expert-fp8", action="store_true", help="use FP8 matmul for routed expert bmm (per-expert tensorwise scaling)")
+parser.add_argument("--moe-first-layer", type=int, default=0, help="layers [0, moe-first-layer) stay dense; [moe-first-layer, n_layer) are MoE. 1 = '1dense+SE' (arxiv 2506.12119)")
 # Training horizon (only one used, in order of precedence)
 parser.add_argument("--num-iterations", type=int, default=-1, help="explicit number of optimization steps (-1 = disable)")
 parser.add_argument("--target-flops", type=float, default=-1.0, help="calculate num_iterations to reach target_flops (-1 = disable)")
@@ -153,6 +154,7 @@ def build_model_meta(depth):
         expert_hidden_dim=args.expert_hidden_dim,
         expert_parallel=args.expert_parallel,
         moe_expert_fp8=args.moe_expert_fp8,
+        moe_first_layer=args.moe_first_layer,
     )
     with torch.device("meta"):
         model_meta = GPT(config)

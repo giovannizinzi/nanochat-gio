@@ -47,6 +47,9 @@ class GPTConfig:
     expert_hidden_dim: int = -1  # -1 = auto (compute-matched to dense active FFN)
     expert_parallel: bool = False  # if True (+ num_experts % world_size == 0), shard experts across GPUs
     moe_expert_fp8: bool = False   # if True, use FP8 matmuls for routed expert bmm (per-expert tensorwise scaling)
+    # Layers [0, moe_first_layer) stay dense (MLP); layers [moe_first_layer, n_layer) are MoE.
+    # Paper arxiv.org/abs/2506.12119 Table 6: moe_first_layer=1 ("1dense + SE") beats fully-MoE.
+    moe_first_layer: int = 0
 
 
 def norm(x):
@@ -153,7 +156,7 @@ class Block(nn.Module):
     def __init__(self, config, layer_idx):
         super().__init__()
         self.attn = CausalSelfAttention(config, layer_idx)
-        self.use_moe = config.num_experts > 1
+        self.use_moe = config.num_experts > 1 and layer_idx >= config.moe_first_layer
         self.mlp = MoE(config) if self.use_moe else MLP(config)
 
     def forward(self, x, ve, cos_sin, window_size, kv_cache):
@@ -355,12 +358,14 @@ class GPT(nn.Module):
                           self.resid_lambdas.numel() + self.x0_lambdas.numel() +
                           self.smear_gate.weight.numel() + self.smear_lambda.numel() + self.backout_lambda.numel())
         # Exclude inactive MoE expert params: (num_experts - top_k) / num_experts of routed experts.
+        # Only layers >= moe_first_layer have experts; earlier layers are dense MLP and contribute nothing here.
         moe_inactive = 0
-        if self.config.num_experts > 1:
-            moe = self.transformer.h[0].mlp
+        num_moe_layers = max(0, self.config.n_layer - self.config.moe_first_layer) if self.config.num_experts > 1 else 0
+        if num_moe_layers > 0:
+            moe = self.transformer.h[self.config.moe_first_layer].mlp
             expert_hidden = moe.expert_hidden_dim
             inactive_per_layer = (self.config.num_experts - self.config.top_k) * 2 * self.config.n_embd * expert_hidden
-            moe_inactive = inactive_per_layer * self.config.n_layer
+            moe_inactive = inactive_per_layer * num_moe_layers
         h, q, t = self.config.n_head, self.config.n_embd // self.config.n_head, self.config.sequence_len
         # Sum attention FLOPs per layer, accounting for sliding window
         attn_flops = 0
@@ -396,18 +401,19 @@ class GPT(nn.Module):
         # scaling-law math (active_* etc.) sees the full logical model.
         moe_inactive = 0
         ep_missing = 0  # routed-expert params held on OTHER ranks under EP
-        if self.config.num_experts > 1:
-            moe = self.transformer.h[0].mlp
+        num_moe_layers = max(0, self.config.n_layer - self.config.moe_first_layer) if self.config.num_experts > 1 else 0
+        if num_moe_layers > 0:
+            moe = self.transformer.h[self.config.moe_first_layer].mlp
             expert_hidden = moe.expert_hidden_dim
             per_expert_ffn = 2 * self.config.n_embd * expert_hidden
             # Global routed-expert params (across all ranks if EP is on)
             routed_params_per_layer_global = self.config.num_experts * per_expert_ffn
             # Inactive per token = (num_experts - top_k) fraction of routed params
             inactive_per_layer = routed_params_per_layer_global - (self.config.top_k * per_expert_ffn)
-            moe_inactive = inactive_per_layer * self.config.n_layer
+            moe_inactive = inactive_per_layer * num_moe_layers
             if getattr(moe, "expert_parallel", False):
                 local_routed_per_layer = moe.E_per_rank * per_expert_ffn
-                ep_missing = (routed_params_per_layer_global - local_routed_per_layer) * self.config.n_layer
+                ep_missing = (routed_params_per_layer_global - local_routed_per_layer) * num_moe_layers
         transformer_matrices_global = transformer_matrices + ep_missing
         total_global = wte + value_embeds + lm_head + transformer_matrices_global + scalars
         active_transformer_matrices = transformer_matrices_global - moe_inactive
@@ -444,6 +450,8 @@ class GPT(nn.Module):
         ep_expert_params = []
         if self.config.num_experts > 1:
             for block in self.transformer.h:
+                if not block.use_moe:  # skip dense layers under mixed-layout (1dense+SE)
+                    continue
                 router_params.append(block.mlp.router_weight)
                 if getattr(block.mlp, "expert_parallel", False):
                     ep_expert_params.append(block.mlp.w_fc)
