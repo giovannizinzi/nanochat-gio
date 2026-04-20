@@ -107,6 +107,10 @@ class MoE(nn.Module):
 
         # FP8 for routed-expert matmuls (independent of --fp8 which handles nn.Linear only).
         self.moe_expert_fp8 = bool(getattr(config, "moe_expert_fp8", False))
+        # Expert-choice routing: experts pick their top-capacity tokens instead of tokens
+        # picking experts. Perfect load balance, no dropped tokens, no aux loss needed.
+        # Ref: Zhou et al. 2022, "Mixture-of-Experts with Expert Choice Routing" (NeurIPS).
+        self.moe_expert_choice = bool(getattr(config, "moe_expert_choice", False))
 
         # Router: replicated across ranks (decision must be consistent globally).
         self.router_weight = nn.Parameter(torch.empty(self.num_experts, self.n_embd))
@@ -145,6 +149,51 @@ class MoE(nn.Module):
         if self.ws_fc is not None:
             torch.nn.init.uniform_(self.ws_fc, -s * 0.4, s * 0.4)
             torch.nn.init.zeros_(self.ws_proj)
+
+    # -------------------------------------------------------------------------
+    # Forward — expert-choice routing (experts pick tokens instead of tokens pick experts).
+    # Zhou et al. 2022 NeurIPS. Each expert independently picks its top-C highest-scored
+    # tokens; tokens may be picked 0..E times. No aux loss required — load is balanced by
+    # construction. No dropping: unpicked tokens pass through via residual only.
+    # -------------------------------------------------------------------------
+    def _forward_expert_choice(self, x_flat, routing_scores, N, E, k, D):
+        # routing_scores: (N, E) — raw softmax probabilities over experts per token.
+        # Capacity target: same as token-choice (keep matched FLOPs): C = ceil(cf * k * N / E).
+        C = max(1, int(math.ceil(self.capacity_factor * k * N / E)))
+
+        # Each expert picks its top-C tokens by score. Shape: (E, C).
+        # Transpose to (E, N) so topk runs per-expert along the token dim.
+        expert_scores = routing_scores.T.contiguous()                       # (E, N)
+        top_scores, top_tok_idx = expert_scores.topk(C, dim=-1)             # both (E, C)
+
+        # Gather token features for each expert. (E, C, D) via advanced indexing.
+        # top_tok_idx is long; x_flat[top_tok_idx] gives (E, C, D) directly.
+        expert_inputs = x_flat[top_tok_idx]                                 # (E, C, D)
+        # Weight inputs by routing score so gradients flow through the gate values.
+        expert_inputs = expert_inputs * top_scores.to(x_flat.dtype).unsqueeze(-1)
+
+        # Expert FFN (same as token-choice path).
+        w_fc = self.w_fc.to(x_flat.dtype)
+        w_proj = self.w_proj.to(x_flat.dtype)
+        if self.moe_expert_fp8:
+            try:
+                from nanochat.fp8 import fp8_expert_bmm_grouped as _bmm_fn
+            except Exception:
+                from nanochat.fp8 import fp8_expert_bmm as _bmm_fn
+            hidden = _bmm_fn(expert_inputs, w_fc)
+            hidden = F.relu(hidden).square()
+            expert_output = _bmm_fn(hidden, w_proj)
+        else:
+            hidden = torch.bmm(expert_inputs, w_fc)
+            hidden = F.relu(hidden).square()
+            expert_output = torch.bmm(hidden, w_proj)
+
+        # Scatter back: each (e, c) slot contributes to token top_tok_idx[e, c].
+        flat_tok = top_tok_idx.reshape(-1)                                  # (E*C,)
+        flat_out = expert_output.reshape(-1, D)                             # (E*C, D)
+        routed_out = torch.zeros_like(x_flat)
+        routed_out.scatter_add_(0, flat_tok.unsqueeze(-1).expand(-1, D), flat_out)
+        return routed_out
 
     # -------------------------------------------------------------------------
     # Forward — replicated (single-GPU / single-rank / EP-disabled) path
@@ -304,23 +353,28 @@ class MoE(nn.Module):
         # only its own tokens, but uses the same router weights).
         router_logits = F.linear(x_flat, self.router_weight.to(x.dtype))
         routing_probs = F.softmax(router_logits.float(), dim=-1)
-        topk_probs_f, topk_idx = routing_probs.topk(k, dim=-1)
-        topk_probs_f = topk_probs_f / (topk_probs_f.sum(dim=-1, keepdim=True) + 1e-9)
-        topk_probs = topk_probs_f.to(x.dtype)
 
-        # Aux loss: computed locally per rank (no all_reduce — gradient contributions are
-        # added across ranks anyway by the grad reduction in DistMuonAdamW).
-        with torch.no_grad():
-            one_hot_top1 = F.one_hot(topk_idx[:, 0], num_classes=E).to(routing_probs.dtype)
-            f = one_hot_top1.mean(dim=0)
-        p = routing_probs.mean(dim=0)
-        aux_loss = self.aux_loss_coef * float(E) * (f * p).sum()
-
-        # Route + expert compute.
-        if self.expert_parallel:
-            routed_out = self._forward_ep(x_flat, topk_probs, topk_idx, N, E, k, D)
+        if self.moe_expert_choice:
+            # Expert-choice: experts pick top-C tokens; no aux loss needed (perfect balance).
+            routed_out = self._forward_expert_choice(x_flat, routing_probs, N, E, k, D)
+            aux_loss = torch.zeros((), device=x.device, dtype=torch.float32)
         else:
-            routed_out = self._forward_replicated(x_flat, topk_probs, topk_idx, N, E, k, D)
+            # Token-choice: tokens pick top-k experts (default path).
+            topk_probs_f, topk_idx = routing_probs.topk(k, dim=-1)
+            topk_probs_f = topk_probs_f / (topk_probs_f.sum(dim=-1, keepdim=True) + 1e-9)
+            topk_probs = topk_probs_f.to(x.dtype)
+
+            # Switch-style aux loss for load balance.
+            with torch.no_grad():
+                one_hot_top1 = F.one_hot(topk_idx[:, 0], num_classes=E).to(routing_probs.dtype)
+                f = one_hot_top1.mean(dim=0)
+            p = routing_probs.mean(dim=0)
+            aux_loss = self.aux_loss_coef * float(E) * (f * p).sum()
+
+            if self.expert_parallel:
+                routed_out = self._forward_ep(x_flat, topk_probs, topk_idx, N, E, k, D)
+            else:
+                routed_out = self._forward_replicated(x_flat, topk_probs, topk_idx, N, E, k, D)
 
         y = (routed_out + shared_out).view(B, T, D)
         return y, aux_loss

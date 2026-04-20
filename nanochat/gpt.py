@@ -50,6 +50,9 @@ class GPTConfig:
     # Layers [0, moe_first_layer) stay dense (MLP); layers [moe_first_layer, n_layer) are MoE.
     # Paper arxiv.org/abs/2506.12119 Table 6: moe_first_layer=1 ("1dense + SE") beats fully-MoE.
     moe_first_layer: int = 0
+    # Expert-choice routing (Zhou et al. 2022 NeurIPS): experts pick top-C tokens instead of
+    # tokens picking top-k experts. Perfect load balance by construction; no aux loss, no drops.
+    moe_expert_choice: bool = False
 
 
 def norm(x):
