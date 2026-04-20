@@ -30,7 +30,24 @@ Compute: ~330ms/step at d12 × 1500 iters = ~8 min/experiment. CORE at d12 is no
 
 Striking val_bpb ↔ CORE decoupling: MoE compresses bits better but dense generalizes better to downstream tasks. At our scale, the router's specialization benefit for training data distribution hurts CORE. **Dense d22 FP8 is the real baseline to beat, not the earlier d26 number — and MoE still loses at matched depth & compute.**
 
-## BREAKTHROUGH: shared=3 helps (v74, 1500 iter)
+## Final 6000-iter matched-depth scoreboard (the real race)
+
+| config | wall-clock | val_bpb | CORE | Δ CORE vs dense |
+|---|---:|---:|---:|---:|
+| dense d22 FP8 (v73) | 88 min | 0.724 | **0.2694** | — |
+| MoE d22 sh=1 (v58) | 142 min | 0.712 | 0.2568 | **−0.0126** |
+| MoE d22 sh=3 (v75) | 142 min | 0.714 | **0.2651** | **−0.0043** |
+
+**Dense still wins the 6000-iter race, but shared=3 closed the gap from 0.013 → 0.004.**
+
+At matched wall-clock 88 min (dense's budget):
+- Dense: CORE 0.2694 (full run complete)
+- MoE sh=3: reaches only step ~3700, val_bpb ~0.76, CORE ~0.24 (from trajectory)
+- Gap at 88 min: dense beats MoE by ~0.03 CORE.
+
+Dense d22 FP8 remains the winner on time-to-CORE. MoE sh=3 is the best MoE config we've found — it's 0.008 CORE better than v58 (MoE sh=1) — but can't close the MFU gap (44% vs 57%).
+
+## BREAKTHROUGH (qualified): shared=3 helps (v74, 1500 iter)
 
 Tested the "router over-specialization hurts CORE" hypothesis by raising shared experts
 from 1 → 3 (compute-matched via halving Dₑ 4096 → 2048):
