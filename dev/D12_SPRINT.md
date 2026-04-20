@@ -30,6 +30,17 @@ Compute: ~330ms/step at d12 × 1500 iters = ~8 min/experiment. CORE at d12 is no
 
 Striking val_bpb ↔ CORE decoupling: MoE compresses bits better but dense generalizes better to downstream tasks. At our scale, the router's specialization benefit for training data distribution hurts CORE. **Dense d22 FP8 is the real baseline to beat, not the earlier d26 number — and MoE still loses at matched depth & compute.**
 
+## Shared-expert sweep at d22 1500 iter (sh=3 is the sweet spot)
+
+| shared | Dₑ | val_bpb | CORE | Δ vs sh=1 |
+|---|---|---|---|---|
+| 1 (v72) | 4096 | 0.780 | 0.1971 | baseline |
+| **3 (v74)** | **2048** | **0.781** | **0.2090** | **+0.0119 (peak)** |
+| 5 (v76) | 1408 | 0.784 | 0.2072 | +0.0101 |
+
+Peak at sh=3. Not monotonic — sh=5 starts to regress. Diminishing returns beyond sh=3,
+consistent with DeepSeek-v3's choice of 2-3 shared experts.
+
 ## Final 6000-iter matched-depth scoreboard (the real race)
 
 | config | wall-clock | val_bpb | CORE | Δ CORE vs dense |
