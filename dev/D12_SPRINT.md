@@ -37,6 +37,7 @@ Striking val_bpb ↔ CORE decoupling: MoE compresses bits better but dense gener
 | 1 (v72) | 4096 | 0.780 | 0.1971 | baseline |
 | **3 (v74)** | **2048** | **0.781** | **0.2090** | **+0.0119 (peak)** |
 | 5 (v76) | 1408 | 0.784 | 0.2072 | +0.0101 |
+| 3 + K=2 (v77) | 1664 | 0.785 | 0.2098 | +0.0127 |
 
 Peak at sh=3. Not monotonic — sh=5 starts to regress. Diminishing returns beyond sh=3,
 consistent with DeepSeek-v3's choice of 2-3 shared experts.
