@@ -63,3 +63,69 @@ Previous dev notes compared MoE d22 against dense d26 FP8, declaring MoE loses b
 1. **Pursue shared=5, shared=7 at d22**: simple hyperparameter sweep, cheap. Might push past dense at sh=5.
 2. **Scale v75 config to Karpathy speedrun length (8.25B tokens = ~7800 iter)** for full apples-to-apples on the leaderboard.
 3. If #1 gives CORE > 0.2694 at 6000 iter, pair with `--fp8 --moe-expert-fp8` and call the win.
+
+## Follow-up session findings (2026-04-20)
+
+### ScatterMoE Triton kernel works, but replicated memory ceiling blocks true fine-grained MoE
+
+Vendored ScatterMoE (github.com/shawntan/scattermoe, Apache-2.0) into
+`nanochat/kernels/scattermoe/`. Wired behind `--moe-scattermoe` flag.
+Kernel runs correctly and saturates tensor cores (v85 E=16 K=2 Dₑ=1024
+bf16: 1.42s/step ≈ v58 bmm baseline).
+
+**Memory ceiling discovered** at d22 replicated: active-intermediate buffers
+scale as K × N × Dₑ × 22 layers × 2 bytes × (forward + backward + autograd
+save). Practical budget is K × Dₑ ≲ 2048 before OOM. Pareto frontier:
+
+| config | K | Dₑ | active FFN | fits? |
+|---|---|---|---|---|
+| v85 ScatterMoE | 2 | 1024 | 3072 | ✅ |
+| v87 ScatterMoE | 2 | 2048 | 6144 | ❌ OOM |
+| v88 ScatterMoE | 4 | 512 | 2560 | ❌ OOM |
+| v89 ScatterMoE | 2 | 512 | 1536 | ✅ |
+
+This means at d22 replicated, ScatterMoE cannot match v74's active=8192 setup.
+Either sparsity (E≥16) or compute (active≥6144) — not both.
+
+**v89 E=32 K=2 sh=1 Dₑ=512 (true fine-grained, r_a=9%)**: CORE 0.1818,
+val_bpb 0.809. Worst so far because active FFN=1536 is way undermatched vs
+dense d22's 5632. Sparsity alone does not compensate for compute starvation.
+
+### Other attempts this session
+
+| idea | result |
+|---|---|
+| `--moe-routed-scaling=2.827` (DeepSeek-V3/K2.6) | in code, only tested in broken v83 |
+| `--moe-auxfree-bias` (DeepSeek-V3 aux-loss-free) | v83 ran at 3.8 s/step, MFU 13% — in-place `.add_()` on the bias buffer broke torch.compile |
+| V3-mini E=32 K=4 Dₑ=512 bmm (v79) | 3.4 s/step, MFU 10% — tiny-matmul disaster, killed |
+| sh=2 Dₑ=2752 (v78) | CORE 0.1844, outlier noise below sh=1 |
+| K=2 sh=3 combined (v77) | +0.0008 CORE over K=1 sh=3, marginal |
+| sh=5 Dₑ=1408 (v76) | CORE 0.2072 (drops below sh=3 peak 0.2090) |
+| E=8 K=1 sh=3 Dₑ=1408 + auxfree + routed_scaling=2.827 (v83) | CORE 0.1939, below dense d22 |
+
+### What would unlock true very-sparse MoE on this hardware
+
+1. **Expert Parallelism + working CORE eval**: shard E experts across 8 GPUs,
+   each rank holds E/8 experts. Removes the replicated memory ceiling. Our
+   `_forward_ep` exists but CORE eval crashed on variable-shape all_to_all.
+   Workaround is `--core-metric-every=999999`; still worth a retry.
+2. **Gradient checkpointing on MoE blocks**: trades compute for activation
+   memory. Would let v87 (K=2 Dₑ=2048) fit. Modest code change.
+3. **FP8 MoE through forward AND backward**: halves memory + improves MFU.
+   Our current FP8 grouped saves FP8 tensors for backward but still holds
+   bf16 activations for autograd.
+4. **Switch to d16/d18 MoE**: smaller activations → more MoE memory budget.
+   But prior data showed MoE-vs-dense gap widens at lower depths (MoE only
+   led at d12).
+
+### Verdict
+
+**v75 (d22 MoE E=4 K=1 sh=3 Dₑ=2048 bmm, CORE 0.2651 at 142 min) remains
+the best MoE config found.** Dense d22 FP8 (CORE 0.2694 at 88 min) still
+wins time-to-CORE by ~55 minutes at matched depth.
+
+The core bottleneck is structural: at d22 replicated, we can't access the
+configurations (very-sparse + compute-matched) where modern Chinese OSS MoE
+actually beats dense. Closing the gap requires either EP or a scale where
+VRAM is less constrained (d16 probably; Karpathy speedrun length definitely).
+
