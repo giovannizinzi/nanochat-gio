@@ -53,6 +53,10 @@ class GPTConfig:
     # Expert-choice routing (Zhou et al. 2022 NeurIPS): experts pick top-C tokens instead of
     # tokens picking top-k experts. Perfect load balance by construction; no aux loss, no drops.
     moe_expert_choice: bool = False
+    # Aux-loss-free load balancing (DeepSeek-V3, arxiv 2408.15664). Per-expert bias updated
+    # each step by sign(avg_load − load_e). Replaces Switch aux loss without gradient noise.
+    moe_auxfree_bias: bool = False
+    moe_auxfree_bias_lr: float = 1e-3
 
 
 def norm(x):

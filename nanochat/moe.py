@@ -112,6 +112,19 @@ class MoE(nn.Module):
         # Ref: Zhou et al. 2022, "Mixture-of-Experts with Expert Choice Routing" (NeurIPS).
         self.moe_expert_choice = bool(getattr(config, "moe_expert_choice", False))
 
+        # Aux-loss-free load balancing (DeepSeek-V3, arxiv 2408.15664):
+        # Per-expert bias added to router logits for top-k SELECTION only (not for
+        # gate probabilities), updated each step by sign(avg_load − load_e) × lr_bias.
+        # Removes the interference-gradient cost of Switch-style aux loss while keeping
+        # loads balanced. When enabled, aux_loss_coef ≈ 0 is the paper-recommended setup.
+        self.moe_auxfree_bias = bool(getattr(config, "moe_auxfree_bias", False))
+        self.moe_auxfree_bias_lr = float(getattr(config, "moe_auxfree_bias_lr", 1e-3))
+        if self.moe_auxfree_bias:
+            # Non-learnable (register_buffer) so optimizer doesn't touch it; updated manually.
+            self.register_buffer("expert_bias", torch.zeros(self.num_experts), persistent=True)
+        else:
+            self.expert_bias = None
+
         # Router: replicated across ranks (decision must be consistent globally).
         self.router_weight = nn.Parameter(torch.empty(self.num_experts, self.n_embd))
 
@@ -360,16 +373,33 @@ class MoE(nn.Module):
             aux_loss = torch.zeros((), device=x.device, dtype=torch.float32)
         else:
             # Token-choice: tokens pick top-k experts (default path).
-            topk_probs_f, topk_idx = routing_probs.topk(k, dim=-1)
+            # With aux-loss-free bias: top-k SELECTION uses biased logits; gate PROBABILITIES
+            # come from un-biased softmax. Keeps gradients clean while balancing selection.
+            if self.moe_auxfree_bias:
+                selection_probs = F.softmax(router_logits.float() + self.expert_bias, dim=-1)
+                _, topk_idx = selection_probs.topk(k, dim=-1)
+                # Gather gate probabilities from unbiased softmax at the chosen expert indices.
+                topk_probs_f = routing_probs.gather(-1, topk_idx)
+            else:
+                topk_probs_f, topk_idx = routing_probs.topk(k, dim=-1)
             topk_probs_f = topk_probs_f / (topk_probs_f.sum(dim=-1, keepdim=True) + 1e-9)
             topk_probs = topk_probs_f.to(x.dtype)
 
-            # Switch-style aux loss for load balance.
-            with torch.no_grad():
-                one_hot_top1 = F.one_hot(topk_idx[:, 0], num_classes=E).to(routing_probs.dtype)
-                f = one_hot_top1.mean(dim=0)
-            p = routing_probs.mean(dim=0)
-            aux_loss = self.aux_loss_coef * float(E) * (f * p).sum()
+            if self.moe_auxfree_bias:
+                # Update bias: b_e += lr * sign(avg_load - load_e). Done in no_grad.
+                with torch.no_grad():
+                    onehot = F.one_hot(topk_idx.reshape(-1), num_classes=E).to(torch.float32)
+                    load = onehot.sum(dim=0)                       # (E,) count per expert this step
+                    avg_load = load.mean()
+                    self.expert_bias.add_(self.moe_auxfree_bias_lr * torch.sign(avg_load - load))
+                aux_loss = torch.zeros((), device=x.device, dtype=torch.float32)
+            else:
+                # Switch-style aux loss for load balance.
+                with torch.no_grad():
+                    one_hot_top1 = F.one_hot(topk_idx[:, 0], num_classes=E).to(routing_probs.dtype)
+                    f = one_hot_top1.mean(dim=0)
+                p = routing_probs.mean(dim=0)
+                aux_loss = self.aux_loss_coef * float(E) * (f * p).sum()
 
             if self.expert_parallel:
                 routed_out = self._forward_ep(x_flat, topk_probs, topk_idx, N, E, k, D)
