@@ -17,7 +17,25 @@ Compute: ~330ms/step at d12 × 1500 iters = ~8 min/experiment. CORE at d12 is no
 | v69 (MoE d12 EC) | expert-choice routing | 0.871 | **0.1292** | EC WORSE than TC by −0.011 CORE. At our scale expert-choice provides no benefit over token-choice. |
 | v71 (dense d22 FP8, 1500 iter) | matched-depth baseline | **0.791** | **0.1969** | New honest dense baseline at d22. Karpathy's dense d26 was unfair vs MoE d22. |
 | v72 (MoE d22 TC, 1500 iter) | v58 config at 1500 iter | **0.780** | **0.1971** | **MoE ties dense at matched depth d22, both val_bpb (MoE +0.011) and CORE (MoE +0.0002). Reopens the race.** |
-| v73 (dense d22 FP8, 6000 iter) | true matched-depth long run | running | | Compare against v58 MoE d22 (CORE 0.2568). |
+| v73 (dense d22 FP8, 6000 iter) | true matched-depth long run | **0.724** | **0.2694** | **Dense wins.** 88 min (1.6× faster than MoE). CORE 0.0126 above v58 MoE d22 (0.2568). |
+
+## Definitive matched-depth 6000-iter comparison
+
+| metric | dense d22 FP8 (v73) | MoE d22 FP8 (v58) | winner |
+|---|---|---|---|
+| wall-clock | 88 min | 142 min | **dense** |
+| val_bpb | 0.724 | 0.712 | MoE (−0.012) |
+| CORE | 0.2694 | 0.2568 | **dense (+0.0126)** |
+| MFU | 56.78% | 44% | dense |
+
+Striking val_bpb ↔ CORE decoupling: MoE compresses bits better but dense generalizes better to downstream tasks. At our scale, the router's specialization benefit for training data distribution hurts CORE. **Dense d22 FP8 is the real baseline to beat, not the earlier d26 number — and MoE still loses at matched depth & compute.**
+
+## What might still work (untested or inconclusive)
+
+- **MoE with more iterations than dense at same wall-clock**: dense d22 finishes 6000 iter in 88 min; MoE d22 could run 6000 iter at 142 min but MoE per-step CORE-per-iter scales differently. Running MoE longer than matched-iter (e.g. 10k iter to match dense 6k wall-clock) might flip it. Untested.
+- **MoE with active-params > dense**: our configs had active ≈ dense, so no compute-per-token advantage. Making MoE active > dense (e.g. top-k=2) at matched wall-clock → MoE becomes a bigger model per token and maybe outperforms on CORE. Untested at d22.
+- **Expert-parallel at d26 MoE**: fits d26 but previous CORE eval crashed. Could be re-tried with core_metric_every=-1.
+- **FP8-through-backward for MoE experts**: would close the MFU gap (current 44% → ~55%). Deep engineering work.
 
 ## Scoreboard by depth (all 1500 iter)
 
