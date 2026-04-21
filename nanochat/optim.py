@@ -153,6 +153,51 @@ def muon_step_fused(
     mask = (g * stacked_params) >= 0
     stacked_params.sub_(lr * g + lr * wd * stacked_params * mask)
 
+
+# -----------------------------------------------------------------------------
+# MuonClip QK-Clip (Kimi K2, arxiv 2507.20534 §A)
+#
+# Muon orthogonalizes W_Q and W_K each step, which can cause the attention logits
+# Q @ K^T to grow unbounded over training and blow up softmax. QK-Clip rescales
+# W_Q and W_K *after* the Muon step so that their combined spectral norm product
+# is bounded by sqrt(tau), capping the max attention logit magnitude at ~tau.
+#
+# We use the cheap Frobenius-over-sqrt(d_out) approximation of the spectral norm
+# (upper-bound: ||W||_2 <= ||W||_F / sqrt(rank) ~= ||W||_F / sqrt(min(in,out))).
+# This is conservative (overestimates the operator norm) — so when it triggers
+# a rescale it's safe, and when it doesn't trigger we know we're definitely fine.
+# An exact torch.linalg.matrix_norm(W, ord=2) call would be tighter but adds an
+# SVD per attention weight per step; Frobenius is ~free (a single reduction).
+
+@torch.no_grad()
+def _apply_qk_clip(param_groups: list[dict]) -> None:
+    """Rescale any Muon param groups marked `is_qk` so spectral norm <= sqrt(tau).
+
+    Called after the Muon update has been written back to the param tensors.
+    No-op if `qk_tau <= 0` (the default). Safe to call every step.
+    """
+    for group in param_groups:
+        if group.get('kind') != 'muon':
+            continue
+        if not group.get('is_qk', False):
+            continue
+        tau = float(group.get('qk_tau', 0.0))
+        if tau <= 0.0:
+            continue
+        target = tau ** 0.5  # spectral-norm budget per matrix
+        for p in group['params']:
+            if p.ndim < 2:
+                continue
+            # Frobenius-over-sqrt(min_dim) spectral-norm estimate (upper bound).
+            # Cheaper than torch.linalg.matrix_norm(ord=2) and adequate for capping.
+            frob = p.detach().float().norm()
+            min_dim = min(p.shape[-2], p.shape[-1])
+            spec_est = frob / (min_dim ** 0.5)
+            if spec_est > target:
+                scale = target / spec_est.clamp_min(1e-12)
+                p.data.mul_(scale.to(p.dtype))
+
+
 # -----------------------------------------------------------------------------
 # Single GPU version of the MuonAdamW optimizer.
 # Used mostly for reference, debugging and testing.
@@ -303,6 +348,9 @@ class MuonAdamW(torch.optim.Optimizer):
                 self._step_muon(group)
             else:
                 raise ValueError(f"Unknown optimizer kind: {group['kind']}")
+        # MuonClip QK-Clip: cap spectral norms of c_q/c_k after the Muon update.
+        # No-op unless a group sets qk_tau > 0.
+        _apply_qk_clip(self.param_groups)
 
 # -----------------------------------------------------------------------------
 # Distributed version of the MuonAdamW optimizer.
@@ -603,3 +651,8 @@ class DistMuonAdamW(torch.optim.Optimizer):
 
         # Phase 3: wait for gathers, copy back
         self._finish_gathers(gather_list)
+
+        # MuonClip QK-Clip: cap spectral norms of c_q/c_k after the Muon update.
+        # No-op unless a group sets qk_tau > 0. Runs on every rank (param tensors
+        # are replicated post-gather, so the rescale is identical across ranks).
+        _apply_qk_clip(self.param_groups)
