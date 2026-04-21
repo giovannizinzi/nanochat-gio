@@ -68,6 +68,10 @@ parser.add_argument("--moe-auxfree-bias-lr", type=float, default=1e-3, help="bia
 parser.add_argument("--moe-routed-scaling", type=float, default=1.0, help="scale applied to gate probabilities before combining expert outputs (DeepSeek-V3: 2.827)")
 parser.add_argument("--moe-scattermoe", action="store_true", help="use ScatterMoE Triton kernels (Tan 2024) instead of torch.bmm. Keeps tensor cores fed at E>=16.")
 parser.add_argument("--moe-grad-checkpoint", action="store_true", help="recompute MoE FFN activations in backward (activation checkpointing). Breaks the K*D_e VRAM ceiling at cost of ~33% extra compute.")
+# Dense FFN activation
+parser.add_argument("--ffn-type", type=str, default="relu2", choices=["relu2", "swiglu"], help="dense MLP activation: relu2 (Primer, current default) or swiglu (Shazeer 2020; Llama/Qwen/DeepSeek). Affects dense layers only; MoE experts are unchanged.")
+# Logit z-loss (PaLM)
+parser.add_argument("--z-loss-coef", type=float, default=0.0, help="PaLM-style logit z-loss coefficient (arxiv 2204.02311 §5). 0.0 = disabled (default, bit-identical). Typical: 1e-4.")
 parser.add_argument("--max-train-shards", type=int, default=-1, help="cap training parquet shards to first N (enables data reuse / multi-epoch training; arxiv 2506.12119 §6)")
 # Training horizon (only one used, in order of precedence)
 parser.add_argument("--num-iterations", type=int, default=-1, help="explicit number of optimization steps (-1 = disable)")
@@ -169,6 +173,8 @@ def build_model_meta(depth):
         moe_routed_scaling=args.moe_routed_scaling,
         moe_scattermoe=args.moe_scattermoe,
         moe_grad_checkpoint=args.moe_grad_checkpoint,
+        ffn_type=args.ffn_type,
+        z_loss_coef=args.z_loss_coef,
     )
     with torch.device("meta"):
         model_meta = GPT(config)

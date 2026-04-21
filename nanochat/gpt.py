@@ -66,6 +66,15 @@ class GPTConfig:
     # of storing them. Breaks the K*D_e activation-memory ceiling (lets d22 run E=16/K=2/D_e=2048
     # on 80GB H100s). Default False = bit-identical to previous behavior.
     moe_grad_checkpoint: bool = False
+    # Dense FFN activation. "relu2" (default) = Primer-style ReLU², keeps prior behavior.
+    # "swiglu" = SwiGLU (Shazeer 2020, arxiv 2002.05202; used in Llama/Qwen/DeepSeek).
+    # Applies only to the dense MLP path; MoE experts retain their own FFN.
+    ffn_type: str = "relu2"
+    # Router/logit-stabilization z-loss (Chowdhery et al. PaLM, arxiv 2204.02311 §5):
+    #   aux = z_loss_coef * mean((logsumexp(logits))**2)
+    # Keeps log-partition Z close to 0, which stabilizes bf16/fp16 training. 0.0 = disabled
+    # (bit-identical to prior behavior). Typical value: 1e-4.
+    z_loss_coef: float = 0.0
 
 
 def norm(x):
@@ -155,17 +164,48 @@ class CausalSelfAttention(nn.Module):
         return y
 
 
+def _swiglu_hidden_dim(n_embd, multiple_of=64):
+    """SwiGLU compute-matched hidden dim: (8/3)*n_embd rounded up to `multiple_of`.
+    Llama/DeepSeek use this to keep params ~ matched to 4*n_embd ReLU² FFN (two input
+    projections vs one, so 2*(8/3) ≈ 16/3 vs 4+4/3 ≈ not quite equal — close enough)."""
+    hidden = int(8 * n_embd / 3)
+    hidden = ((hidden + multiple_of - 1) // multiple_of) * multiple_of
+    return hidden
+
+
 class MLP(nn.Module):
+    """Dense FFN. Switches activation via config.ffn_type.
+    - "relu2": c_fc(D -> 4D) -> ReLU² -> c_proj(4D -> D)   (default, Primer-style)
+    - "swiglu": c_fc(D -> 2H) -> chunk gate,value -> SiLU(gate)*value -> c_proj(H -> D)
+                where H = round((8/3)*D, 64)  (Shazeer 2020 / Llama convention)
+    Parameter names c_fc and c_proj are preserved in both modes so init_weights() and
+    existing checkpoints that key on these names keep working.
+    """
     def __init__(self, config):
         super().__init__()
-        self.c_fc = Linear(config.n_embd, 4 * config.n_embd, bias=False)
-        self.c_proj = Linear(4 * config.n_embd, config.n_embd, bias=False)
+        self.ffn_type = config.ffn_type
+        if self.ffn_type == "relu2":
+            self.c_fc = Linear(config.n_embd, 4 * config.n_embd, bias=False)
+            self.c_proj = Linear(4 * config.n_embd, config.n_embd, bias=False)
+        elif self.ffn_type == "swiglu":
+            hidden = _swiglu_hidden_dim(config.n_embd)
+            self.hidden = hidden
+            # c_fc projects to 2*hidden: first half is the gate, second half is the value.
+            self.c_fc = Linear(config.n_embd, 2 * hidden, bias=False)
+            self.c_proj = Linear(hidden, config.n_embd, bias=False)
+        else:
+            raise ValueError(f"Unknown ffn_type: {self.ffn_type} (expected 'relu2' or 'swiglu')")
 
     def forward(self, x):
-        x = self.c_fc(x)
-        x = F.relu(x).square()
-        x = self.c_proj(x)
-        return x
+        if self.ffn_type == "relu2":
+            x = self.c_fc(x)
+            x = F.relu(x).square()
+            x = self.c_proj(x)
+            return x
+        else:  # swiglu
+            g, v = self.c_fc(x).chunk(2, dim=-1)
+            x = F.silu(g) * v
+            return self.c_proj(x)
 
 
 class Block(nn.Module):
@@ -620,7 +660,20 @@ class GPT(nn.Module):
             # training: given the targets, compute and return the loss
             # TODO experiment with chunked cross-entropy?
             loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1, reduction=loss_reduction)
+            # PaLM-style z-loss on logits (arxiv 2204.02311 §5): penalize (logsumexp(logits))**2
+            # to keep the log-partition Z near 0. Stabilizes bf16/fp16 training.
+            # At z_loss_coef=0.0 (default) this branch is a no-op and behavior is bit-identical.
+            if self.config.z_loss_coef > 0.0:
+                log_Z = torch.logsumexp(logits, dim=-1)  # (B, T)
+                if loss_reduction == 'mean':
+                    z_loss = (log_Z ** 2).mean()
+                elif loss_reduction == 'sum':
+                    z_loss = (log_Z ** 2).sum()
+                else:  # 'none': keep per-position, caller handles reduction
+                    z_loss = (log_Z ** 2).view(-1)
+                loss = loss + self.config.z_loss_coef * z_loss
             # Always return (ce_loss, aux_loss) pair. Caller sums them for backward and logs them separately.
+            # When z_loss_coef > 0, the z_loss contribution is folded into the ce_loss return value.
             return loss, aux_loss_total
         else:
             # inference: just return the logits directly
