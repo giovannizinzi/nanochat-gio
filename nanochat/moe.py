@@ -28,6 +28,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.distributed as dist
+from torch.utils.checkpoint import checkpoint as _ckpt
 
 from nanochat.common import get_dist_info
 
@@ -127,6 +128,10 @@ class MoE(nn.Module):
         # falls off tensor-core efficiency. Replaces the dispatch + bmm + combine pipeline
         # with two scatter-to-scatter Triton calls. Reports 50%+ MFU on H100 at fine-grain.
         self.moe_scattermoe = bool(getattr(config, "moe_scattermoe", False))
+        # Gradient checkpointing — wraps shared-expert FFN loop and routed-FFN compute in
+        # torch.utils.checkpoint so their intermediates are recomputed in backward. Breaks the
+        # K*D_e activation ceiling that OOMs configs like E=16/K=2/D_e=2048 at d22 on 80GB H100.
+        self.moe_grad_checkpoint = bool(getattr(config, "moe_grad_checkpoint", False))
         if self.moe_auxfree_bias:
             # Non-learnable (register_buffer) so optimizer doesn't touch it; updated manually.
             self.register_buffer("expert_bias", torch.zeros(self.num_experts), persistent=True)
@@ -385,6 +390,18 @@ class MoE(nn.Module):
         )
         return routed_out
 
+    def _shared_ffn(self, x_flat):
+        """Shared-expert FFN loop, factored out so it can be activation-checkpointed.
+        Returns (N, D). The per-shared-expert (N, H) intermediates are the memory hogs here."""
+        ws_fc = self.ws_fc.to(x_flat.dtype)
+        ws_proj = self.ws_proj.to(x_flat.dtype)
+        shared_out = torch.zeros_like(x_flat)
+        for s in range(self.num_shared_experts):
+            h = x_flat @ ws_fc[s]
+            h = F.relu(h).square()
+            shared_out = shared_out + h @ ws_proj[s]
+        return shared_out
+
     def forward(self, x):
         B, T, D = x.shape
         N = B * T
@@ -393,14 +410,13 @@ class MoE(nn.Module):
         x_flat = x.view(N, D)
 
         # Shared-expert branch: always active, no routing, fully replicated.
-        shared_out = torch.zeros_like(x_flat)
         if self.ws_fc is not None:
-            ws_fc = self.ws_fc.to(x.dtype)
-            ws_proj = self.ws_proj.to(x.dtype)
-            for s in range(self.num_shared_experts):
-                h = x_flat @ ws_fc[s]
-                h = F.relu(h).square()
-                shared_out = shared_out + h @ ws_proj[s]
+            if self.moe_grad_checkpoint:
+                shared_out = _ckpt(self._shared_ffn, x_flat, use_reentrant=False)
+            else:
+                shared_out = self._shared_ffn(x_flat)
+        else:
+            shared_out = torch.zeros_like(x_flat)
 
         # Router: replicated, produces consistent routing across ranks (each rank routes
         # only its own tokens, but uses the same router weights).
@@ -409,7 +425,10 @@ class MoE(nn.Module):
 
         if self.moe_expert_choice:
             # Expert-choice: experts pick top-C tokens; no aux loss needed (perfect balance).
-            routed_out = self._forward_expert_choice(x_flat, routing_probs, N, E, k, D)
+            if self.moe_grad_checkpoint:
+                routed_out = _ckpt(self._forward_expert_choice, x_flat, routing_probs, N, E, k, D, use_reentrant=False)
+            else:
+                routed_out = self._forward_expert_choice(x_flat, routing_probs, N, E, k, D)
             aux_loss = torch.zeros((), device=x.device, dtype=torch.float32)
         else:
             # Token-choice: tokens pick top-k experts (default path).
@@ -445,11 +464,17 @@ class MoE(nn.Module):
                 aux_loss = self.aux_loss_coef * float(E) * (f * p).sum()
 
             if self.expert_parallel:
-                routed_out = self._forward_ep(x_flat, topk_probs, topk_idx, N, E, k, D)
+                routed_fn = self._forward_ep
             elif self.moe_scattermoe:
-                routed_out = self._forward_scattermoe(x_flat, topk_probs, topk_idx, N, E, k, D)
+                routed_fn = self._forward_scattermoe
             else:
-                routed_out = self._forward_replicated(x_flat, topk_probs, topk_idx, N, E, k, D)
+                routed_fn = self._forward_replicated
+            if self.moe_grad_checkpoint:
+                # use_reentrant=False is required for torch.compile compatibility and allows
+                # non-tensor args (ints N, E, k, D) to pass through cleanly.
+                routed_out = _ckpt(routed_fn, x_flat, topk_probs, topk_idx, N, E, k, D, use_reentrant=False)
+            else:
+                routed_out = routed_fn(x_flat, topk_probs, topk_idx, N, E, k, D)
 
         y = (routed_out + shared_out).view(B, T, D)
         return y, aux_loss
