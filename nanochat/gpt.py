@@ -450,7 +450,7 @@ class GPT(nn.Module):
             'active_total': active_total,
         }
 
-    def setup_optimizer(self, unembedding_lr=0.004, embedding_lr=0.2, matrix_lr=0.02, weight_decay=0.0, scalar_lr=0.5):
+    def setup_optimizer(self, unembedding_lr=0.004, embedding_lr=0.2, matrix_lr=0.02, weight_decay=0.0, scalar_lr=0.5, muon_qk_clip_tau=0.0):
         model_dim = self.config.n_embd
         ddp, rank, local_rank, world_size = get_dist_info()
 
@@ -474,13 +474,26 @@ class GPT(nn.Module):
                     ep_expert_params.append(block.mlp.w_proj)
             exclude_ids = {id(p) for p in router_params + ep_expert_params}
             matrix_params = [p for p in matrix_params if id(p) not in exclude_ids]
+        # Collect attention c_q/c_k params so we can put them in a dedicated Muon
+        # group tagged for QK-Clip (MuonClip, Kimi K2 arxiv 2507.20534 §A). We pull
+        # them out of the generic matrix_params only when qk_clip is actually
+        # enabled, so default behavior (tau=0) is bit-identical to before.
+        qk_params = []
+        if muon_qk_clip_tau > 0.0:
+            qk_param_ids = set()
+            for block in self.transformer.h:
+                qk_params.append(block.attn.c_q.weight)
+                qk_params.append(block.attn.c_k.weight)
+                qk_param_ids.add(id(block.attn.c_q.weight))
+                qk_param_ids.add(id(block.attn.c_k.weight))
+            matrix_params = [p for p in matrix_params if id(p) not in qk_param_ids]
         value_embeds_params = list(self.value_embeds.parameters())
         embedding_params = list(self.transformer.wte.parameters())
         lm_head_params = list(self.lm_head.parameters())
         resid_params = [self.resid_lambdas]
         x0_params = [self.x0_lambdas]
         smear_params = [self.smear_gate.weight, self.smear_lambda, self.backout_lambda]
-        assert len(list(self.parameters())) == len(matrix_params) + len(router_params) + len(ep_expert_params) + len(embedding_params) + len(lm_head_params) + len(value_embeds_params) + len(resid_params) + len(x0_params) + len(smear_params)
+        assert len(list(self.parameters())) == len(matrix_params) + len(qk_params) + len(router_params) + len(ep_expert_params) + len(embedding_params) + len(lm_head_params) + len(value_embeds_params) + len(resid_params) + len(x0_params) + len(smear_params)
 
         # Scale the LR for the AdamW parameters by ∝1/√dmodel (tuned for 768 dim model)
         dmodel_lr_scale = (model_dim / 768) ** -0.5
@@ -511,6 +524,19 @@ class GPT(nn.Module):
                 momentum=0.95, ns_steps=5, beta2=0.9, weight_decay=weight_decay,
                 replicated=True,
             ))
+        # Dedicated Muon group for QK params when MuonClip is enabled (arxiv 2507.20534 §A).
+        # Split by shape to respect Muon's same-shape-stacking assumption (GQA gives c_q
+        # and c_k different shapes when n_kv_head < n_head).
+        if qk_params:
+            for shape in sorted({p.shape for p in qk_params}):
+                group_params = [p for p in qk_params if p.shape == shape]
+                param_groups.append(dict(
+                    kind='muon', params=group_params, lr=matrix_lr,
+                    momentum=0.95, ns_steps=5, beta2=0.9, weight_decay=weight_decay,
+                    replicated=True,
+                    is_qk=True,
+                    qk_tau=muon_qk_clip_tau,
+                ))
         # Expert Parallel routed-expert groups: each rank holds a unique slice of experts,
         # so the optimizer must NOT reduce gradients across ranks. Muon still orthogonalizes
         # each (D, H) slice independently via its batched polar-express (leading dims OK).
