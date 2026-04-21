@@ -41,6 +41,20 @@ Started: 2026-04-20 evening. Plan: `/Users/gzinzi/.claude/plans/crystalline-soar
 | v114 | 22 | 1500 | dense FP8 +SwiGLU | 0.792 | 0.1949 | | | SwiGLU does NOT transfer to d22 |
 | v115 | 22 | 6000 | dense FP8 +MuonClip tau=100 scale-up | 0.724 | 0.2485 | 880 | 57% | **REGRESSION.** Small 1500-iter win flipped to big 6000-iter loss. |
 | v116 | 22 | 6000 | dense FP8 +warmdown-ratio=0.85 | 0.724 | 0.2588 | 880 | 57% | **REGRESSION.** Tied val_bpb, CORE −0.011. Schedule shape tuned at 0.65 default. |
+| v117 | 22 | **10000** | dense FP8 baseline, longer training | **0.709** | **0.2793** | 880 | 57% | **WIN.** Just training 67% longer → −0.015 val_bpb, +0.010 CORE. Baseline was under-saturated at 6000 iter. 147 min total. |
+
+## Best-ever d22 configs (updated)
+
+| config | iters | wall-clock | val_bpb | CORE |
+|---|---|---:|---:|---:|
+| **v117 dense d22 FP8 (10k iter)** | 10000 | **147 min** | **0.709** | **0.2793** ← new king |
+| v73 dense d22 FP8 (baseline) | 6000 | 88 min | 0.724 | 0.2694 |
+| v75 MoE d22 sh=3 | 6000 | 142 min | 0.714 | 0.2651 |
+
+At wall-clock-matched 88 min, dense d22 FP8 6000-iter (v73) is still the winner. Beyond
+88 min, more training compounds: +0.010 CORE from +67% more tokens. Nothing else in our
+sweep (hyperparameter, architecture, optimizer, MoE) gave ≥+0.005 CORE at d22. The path
+to better val_bpb/CORE at this model size is **more compute**, not cleverer recipe.
 
 ## Final scoreboard at d22 6000-iter matched wall-clock
 
