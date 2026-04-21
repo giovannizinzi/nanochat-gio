@@ -56,6 +56,60 @@ At wall-clock-matched 88 min, dense d22 FP8 6000-iter (v73) is still the winner.
 sweep (hyperparameter, architecture, optimizer, MoE) gave ≥+0.005 CORE at d22. The path
 to better val_bpb/CORE at this model size is **more compute**, not cleverer recipe.
 
+## Leaderboard-aware analysis (after v119)
+
+**The leaderboard is about time-to-CORE-0.2565 (crossing), not final CORE.** Current
+leaderboard entry #6: 1.65 h (99 min), CORE 0.2626 (Karpathy autoresearch round 2).
+
+### v119: instrumented CORE trajectory (baseline recipe, --core-metric-every=500, quick eval 500/task)
+
+| step | val_bpb | CORE (quick) |
+|---:|---:|---:|
+| 500 | 0.914 | 0.117 |
+| 1000 | 0.856 | 0.165 |
+| 1500 | 0.834 | 0.186 |
+| 2000 | 0.821 | 0.191 |
+| 2500 | 0.804 | 0.186 |
+| 3000 | 0.788 | 0.193 |
+| 3500 | 0.774 | 0.219 |
+| 4000 | 0.761 | 0.218 |
+| 4500 | 0.750 | 0.236 |
+| 5000 | 0.739 | 0.246 |
+| 5500 | 0.731 | 0.254 |
+| 6000 | 0.724 | 0.260 |
+
+**Key calibration**: v73 at step 6000 (full eval) got CORE 0.2694; v119 quick eval got
+0.260. Quick-eval underestimates full-eval by ~0.009. So the adjusted trajectory:
+
+| step | CORE (full-eval adj) |
+|---:|---:|
+| 5000 | ~0.255 |
+| 5250 | **~0.260 — crosses GPT-2 0.2565** |
+| 5500 | ~0.263 |
+| 6000 | 0.269 |
+
+Crossing at step ~5250 = **77 min of pure training** (v73 ran 88 min for full 6000 iter).
+
+### Time-to-GPT-2 estimates vs leaderboard
+
+| recipe | final CORE | final wall-clock | est. crossing wall-clock |
+|---|---:|---:|---:|
+| Leaderboard #6 (Karpathy autoresearch 2) | 0.2626 | 99 min | ~99 min |
+| **v73 / v119 baseline (6000 iter)** | **0.2694** | **88 min** | **~77-82 min** ← beats #6 by ~17-22 min |
+| v117 baseline (10000 iter) | 0.2793 | 147 min | ~70-75 min (but eval only at end) |
+| v118 aspect=80+LR=0.03 (10000 iter) | 0.2853 | 202 min | unknown |
+
+### v120: test if compressed schedule crosses earlier (running)
+
+Hypothesis: running baseline at 5000 iter (shorter LR schedule → more warmdown% late)
+might cross 0.2565 at a wall-clock earlier than the 6000-iter recipe.
+
+If v120 final CORE ≥ 0.2565 with wall-clock ≪ 77 min, we have a new time-to-GPT-2
+record. If final CORE < 0.2565, the schedule-compression hypothesis fails.
+
+Expected wall-clock for 5000 iter: 5000 × 0.88s = **73 min**. If final CORE ≥ 0.2565, we
+set a tight budget floor and can explore further.
+
 ## Final scoreboard at d22 6000-iter matched wall-clock
 
 | config | wall-clock | val_bpb | CORE |
