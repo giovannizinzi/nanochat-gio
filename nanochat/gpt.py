@@ -66,6 +66,10 @@ class GPTConfig:
     # of storing them. Breaks the K*D_e activation-memory ceiling (lets d22 run E=16/K=2/D_e=2048
     # on 80GB H100s). Default False = bit-identical to previous behavior.
     moe_grad_checkpoint: bool = False
+    # Scaled Embed / Spike-No-More (arxiv 2312.16903): normalize wte output before the trunk to
+    # eliminate loss spikes and typically enable higher LRs. nanochat applies this norm by default;
+    # the flag exposes an ablation knob. Default True preserves current behavior (bit-identical).
+    embed_norm: bool = True
 
 
 def norm(x):
@@ -569,7 +573,8 @@ class GPT(nn.Module):
         # Embed the tokens
         x = self.transformer.wte(idx) # embed current token
         x = x.to(COMPUTE_DTYPE) # ensure activations are in compute dtype (no-op usually, but active for fp16 code path)
-        x = norm(x)
+        if self.config.embed_norm:
+            x = norm(x) # Scaled Embed / Spike-No-More (arxiv 2312.16903): prevents outlier-magnitude activations
 
         # Smear: mix previous token's embedding into current position (cheap bigram info)
         if kv_cache is None:
