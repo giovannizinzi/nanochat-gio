@@ -67,6 +67,7 @@ parser.add_argument("--moe-auxfree-bias", action="store_true", help="aux-loss-fr
 parser.add_argument("--moe-auxfree-bias-lr", type=float, default=1e-3, help="bias update rate for aux-loss-free balancing")
 parser.add_argument("--moe-routed-scaling", type=float, default=1.0, help="scale applied to gate probabilities before combining expert outputs (DeepSeek-V3: 2.827)")
 parser.add_argument("--moe-scattermoe", action="store_true", help="use ScatterMoE Triton kernels (Tan 2024) instead of torch.bmm. Keeps tensor cores fed at E>=16.")
+parser.add_argument("--moe-grad-checkpoint", action="store_true", help="recompute MoE FFN activations in backward (activation checkpointing). Breaks the K*D_e VRAM ceiling at cost of ~33% extra compute.")
 parser.add_argument("--max-train-shards", type=int, default=-1, help="cap training parquet shards to first N (enables data reuse / multi-epoch training; arxiv 2506.12119 §6)")
 # Training horizon (only one used, in order of precedence)
 parser.add_argument("--num-iterations", type=int, default=-1, help="explicit number of optimization steps (-1 = disable)")
@@ -166,6 +167,7 @@ def build_model_meta(depth):
         moe_auxfree_bias_lr=args.moe_auxfree_bias_lr,
         moe_routed_scaling=args.moe_routed_scaling,
         moe_scattermoe=args.moe_scattermoe,
+        moe_grad_checkpoint=args.moe_grad_checkpoint,
     )
     with torch.device("meta"):
         model_meta = GPT(config)

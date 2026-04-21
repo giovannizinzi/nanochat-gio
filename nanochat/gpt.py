@@ -62,6 +62,10 @@ class GPTConfig:
     # ScatterMoE Triton kernels (Tan et al. 2024) — drop-in replacement for the replicated
     # dispatch+bmm+combine path. Saves VRAM (no padded dispatch buffer) and keeps MFU at E>=16.
     moe_scattermoe: bool = False
+    # Gradient checkpointing for MoE blocks: recomputes FFN activations in backward instead
+    # of storing them. Breaks the K*D_e activation-memory ceiling (lets d22 run E=16/K=2/D_e=2048
+    # on 80GB H100s). Default False = bit-identical to previous behavior.
+    moe_grad_checkpoint: bool = False
 
 
 def norm(x):
