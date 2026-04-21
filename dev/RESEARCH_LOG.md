@@ -39,7 +39,8 @@ Started: 2026-04-20 evening. Plan: `/Users/gzinzi/.claude/plans/crystalline-soar
 | v112 | 12 | 1500 | dense FP8 +SwiGLU | 0.878 | 0.1320 | | | +0.005 CORE at d12 |
 | v113 | 12 | 1500 | dense FP8 +z-loss=1e-4 | 0.883 | 0.1297 | | | marginal |
 | v114 | 22 | 1500 | dense FP8 +SwiGLU | 0.792 | 0.1949 | | | SwiGLU does NOT transfer to d22 |
-| v115 | 22 | 6000 | dense FP8 +MuonClip tau=100 scale-up | 0.724 | 0.2485 | 880 | 57% | **REGRESSION.** Small 1500-iter win flipped to big 6000-iter loss. MuonClip hurts long training. |
+| v115 | 22 | 6000 | dense FP8 +MuonClip tau=100 scale-up | 0.724 | 0.2485 | 880 | 57% | **REGRESSION.** Small 1500-iter win flipped to big 6000-iter loss. |
+| v116 | 22 | 6000 | dense FP8 +warmdown-ratio=0.85 | 0.724 | 0.2588 | 880 | 57% | **REGRESSION.** Tied val_bpb, CORE −0.011. Schedule shape tuned at 0.65 default. |
 
 ## Final scoreboard at d22 6000-iter matched wall-clock
 
