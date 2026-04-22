@@ -186,6 +186,7 @@ as concrete follow-ups.
 | v126 | MuonClip + Muon LR 0.025 | (killed) | — | trailing +0.003 at step 2000, killed early |
 | v127 | warmdown-ratio=0.75 | 0.724 | 0.2509 | **−0.019 CORE** |
 | v128 | warmup-steps=80 | 0.724 | 0.2583 | **−0.011 CORE**, still crosses |
+| v129 | ffn-type=swiglu | 0.726 | 0.2525 | **−0.017 CORE, FAILS to cross target**. SwiGLU's 8/3·D hidden is less effective than relu²'s 4·D. |
 
 Baseline warmdown=0.65 is the right point. Going to 0.75 or 0.85 (v116, −0.011)
 both regress CORE despite identical val_bpb. Same pattern as all other hyperparameter
