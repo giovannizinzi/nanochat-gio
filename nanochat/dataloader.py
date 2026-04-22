@@ -180,13 +180,20 @@ def tokenizing_distributed_data_loader_with_state_bos_bestfit(
         gpu_buffer.copy_(cpu_buffer, non_blocking=use_cuda)
 
         if emit_doc_lens:
-            # Pad each row's segment list to the batch-wide max, then stack.
-            # Segments sum to row_capacity=T+1; after input[:,:-1]/target[:,1:] slicing we
-            # interpret boundaries against the length-T inputs.
-            # Build on CPU then blocking-copy to device — non_blocking from unpinned memory
-            # confuses torch.compile's fake-tensor propagation (device attribution is lost).
-            max_segs = max(len(s) for s in per_row_segments)
-            padded_cpu = torch.zeros((B, max_segs), dtype=torch.int32)
+            # Pad each row's segment list to a FIXED width so torch.compile doesn't
+            # retrace whenever the batch-wide max changes. Observed p99=11, max=13 on
+            # ClimbMix at T=2048 (see scripts/bench_docs_per_row.py), so 32 is safe.
+            # Segments sum to row_capacity=T+1; positions beyond sum are zero-padded,
+            # which the cumsum-based doc-id logic in gpt.py handles correctly (extra
+            # "zero-length segments" at the tail never match any real position).
+            # Build on CPU then blocking-copy to device — non_blocking from unpinned
+            # memory confuses torch.compile's fake-tensor propagation.
+            FIXED_MAX_SEGS = 32
+            observed = max(len(s) for s in per_row_segments)
+            assert observed <= FIXED_MAX_SEGS, (
+                f"docs-per-row ({observed}) exceeded FIXED_MAX_SEGS={FIXED_MAX_SEGS}; "
+                f"raise the constant or reduce packing density")
+            padded_cpu = torch.zeros((B, FIXED_MAX_SEGS), dtype=torch.int32)
             for i, segs in enumerate(per_row_segments):
                 padded_cpu[i, :len(segs)] = torch.tensor(segs, dtype=torch.int32)
             doc_lens = padded_cpu.to(device=device) if use_cuda else padded_cpu
