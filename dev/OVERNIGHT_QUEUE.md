@@ -26,8 +26,11 @@ After each run: log val_bpb at step 2000 + final loss + MFU + per-step dt to thi
 
 | # | Config | step 2000 val_bpb | Δ vs v58 (0.817) | MFU | Notes |
 |---|---|---|---|---|---|
-| v58 (baseline) | d22 E=4 K=1 Dₑ=4096 sh=1 cf=1.0 aux=0.05 | 0.817 | — | 44% | full 6000-iter for CORE |
-| v59 | pending | | | | |
+| v58 (baseline) | d22 E=4 K=1 Dₑ=4096 sh=1 cf=1.0 aux=0.05 | 0.817 | — | 44% | final @ 6000: val_bpb 0.712, **CORE 0.2568** at ~141 min. Barely beats GPT-2 0.2565; loses to dense d26 FP8 (0.2846 at 99 min) on matched wall-clock. |
+| v59 | d22 E=8 K=1 Dₑ=2816 sh=1 **first_layer=1** aux=0.05 FP8 grouped | **0.766** | **−0.051** | 40% | **WINNER.** dt=1243 ms (v58: 1420 ms, 14% faster). CORE@2000=0.206 (quick eval). Scaling to 6000 iters as v60. |
+| v60 (scale-up) | same as v59, 6000 iters, full CORE eval | final 0.716 | — | 40% | **LOSER.** CORE 0.2495 @ 124 min (below GPT-2 0.2565, below v58's 0.2568). v59's 2000-iter lead was LR-schedule artifact. 1dense+SE + r_a=22% + E=8 + D_e=2816 underperforms v58's E=4 D_e=4096 on absolute CORE despite being 18 min faster. |
+| v61 | d24 E=4 K=1 Dₑ=4096 sh=1 first_layer=1 | CRASH OOM | — | — | d24 replicated MoE doesn't fit; would need EP. Skipped. |
+| v62 | d22 E=4 K=1 Dₑ=4096 sh=1 **first_layer=1** aux=0.05 (= v58 + 1dense+SE only) | running | | | Isolates 1dense+SE alone vs v58's 0.817 baseline. |
 
 ## Winner protocol
 

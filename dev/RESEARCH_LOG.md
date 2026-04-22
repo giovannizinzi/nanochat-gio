@@ -241,3 +241,103 @@ Each runs dense d12 FP8 for 1500 iter with ONE flag change vs v64 baseline.
 Scale to d16 anything that hits val_bpb < 0.868.
 
 ## Phase 2/3 — filled after Phase 1 results
+
+---
+
+## 2026-04-22 — data-level experiments, baseline recipe recap
+
+### My v73 baseline vs Karpathy's `runs/speedrun.sh`
+
+Both use: Muon matrix opt + AdamW embeddings, FP8 (tensorwise), `--device-batch-size=16`, total_batch_size=524288 (default), seq_len=2048 (default), ClimbMix-400B dataset.
+
+**Differences:**
+| | Karpathy `runs/speedrun.sh` | My v73 baseline |
+|---|---|---|
+| depth | **24** | 22 |
+| iteration schedule | `--target-param-data-ratio=8` → auto ~7800 iter | explicit `--num-iterations=6000` |
+| tokens seen | ~4.1 B (8× scaling_params) | ~3.1 B |
+| runtime target | ~3 h (advertised speedrun) | 88 min (my measurement) |
+
+Both are compute-optimal-ish around 8-10 tokens/param (vs Chinchilla 20). The d24+ratio=8 recipe trains slightly **undertrained** (Karpathy comment on line 72: "slightly undertrained to beat GPT-2 => decrease data:params ratio from compute optimal 10.5 to 8"). This is deliberate: fewer but bigger-model steps get to CORE 0.2565 fastest per-wall-clock.
+
+My v73 d22 version happened to hit the same CORE target faster (88 min → 0.2694). Unclear until I run v135 whether this is because d22 is a better depth for 8×H100 throughput, or because my smaller step count got lucky.
+
+### v135 launched: d24 + ratio=8 (Karpathy's exact recipe)
+
+Config: `values.d24_karpathy_speedrun.yaml`. Iterations auto-computed from target-param-data-ratio=8 (EXPERIMENT_ITERATIONS=0 falls through to ratio path in `scripts/base_train.py:381-392`). CORE_MAX_PER_TASK=-1 (full eval).
+
+Hypothesis: d24 will beat v73 d22 on CORE because it's Karpathy's tuned optimum for the speedrun. The question is whether the extra depth costs more than 88 min of wall-clock.
+
+### Research agent findings — Jan-Apr 2026 data-level techniques
+
+Top recommendations (ranked by expected CORE gain × low implementation cost):
+
+**Tier 1 (ship tonight):**
+1. **Rephrased pretraining (WRAP)** — Allen-Zhu arxiv 2401.16380 + Qwen3 Mar 2026 report. Replace 20-30% ClimbMix with Qwen-rephrased Wiki/StackExchange in Q&A+textbook styles. **+1.8 CORE at d12/1.5B tokens, 3× data-efficiency**. Zero training LOC; offline shard gen on 1 H100 ~45 min via vLLM. Highest single-bet ROI.
+2. **MATES / DataComp-LM reweighting** — arxiv 2402.09739 + Kimi-K2 Feb 2026. Train 60M proxy on held-out val loss; reweight ClimbMix shards every 500 steps via influence proxy. +0.8-1.2 CORE. ~150 LOC. Orthogonal to ClimbMix (within-mixture vs between-mixture).
+3. **BFD packing + cross-doc attention masking** — Krell et al. + DeepSeek-V3.5 Feb 2026. Replace naive concat-and-chunk; use `torch.nn.attention.flex_attention` document block mask. +0.4 CORE, +3% throughput. ~80 LOC. Fully orthogonal.
+
+**Tier 2 (2 hours):**
+4. Perplexity-correlations filtering (arxiv 2409.05816 + MiniMax-Text-01) — +0.5-0.9 CORE, 40% data reduction. Overlaps MATES.
+5. Short-seq curriculum (Doubao-1.5 Lite Mar 2026) — first 30% at seq=1024, then 2048. +0.3 CORE, 8% faster. **10 LOC**. Free.
+6. JEST joint example selection (DeepMind + Doubao Feb 2026, arxiv 2406.17711) — select batches by learnability score from reference model. +0.6 CORE, 13× less compute-per-CORE. Reference model fwd pass adds ~8% overhead.
+
+**Skip for 1-hour sprint:** RegMix (too expensive), FineWeb-Edu v2 (subsumed), Phi-4 synthetic continuations (only shows at >3B).
+
+**Plan after v135 finishes:**
+1. Short-seq curriculum (10 LOC) — cheapest test, confirms agent's prediction before larger bets
+2. BFD + doc masking (80 LOC) — orthogonal, needs flex_attention refactor
+3. Rephrased pretraining — only if above land something; GPU-time heavy
+
+### v135 result: d24 Karpathy speedrun recipe — LOSES to v73 d22
+
+| metric | v135 d24 ratio=8 | v73 d22 6000iter (mine) | delta |
+|---|---|---|---|
+| val_bpb | **0.7189** | 0.724 | −0.005 (win) |
+| CORE | 0.2611 | **0.2694** | −0.0083 (LOSE) |
+| wall-clock | 99 min | 88 min | +11 min (LOSE) |
+
+**Headline**: My v73 d22 explicit 6000-iter recipe beats Karpathy's canonical d24 speedrun recipe on CORE at matched wall-clock. The val_bpb↔CORE decouple strikes again — bigger d24 model wins val_bpb by 0.005 but loses CORE by 0.008.
+
+**Final trajectory** (v135 d24):
+| step | val_bpb |
+|---|---|
+| 250 | 1.026 |
+| 500 | 0.910 |
+| 1000 | 0.847 |
+| 2000 | 0.809 |
+| 3000 | 0.773 |
+| 4000 | 0.746 |
+| 5000 | 0.726 |
+| 5568 | **0.719** |
+
+Implication: The d22 vs d24 choice is CORE-dependent, not val_bpb-dependent. Future experiments should continue at d22 (where my baseline lives) rather than chase d24 for marginal val_bpb.
+
+### v136 result: d22 seq=1024 at 6000 iter — big LOSS
+
+Hypothesis: d12 seq=1024 gained +0.018 CORE at small scale; maybe the shorter seq is just better data-efficiency and it transfers to d22.
+
+Result: **CORE 0.2434** at 98 min (5899s) — val_bpb 0.7319.
+
+| metric | v136 d22 seq=1024 | v73 d22 seq=2048 (champ) | delta |
+|---|---|---|---|
+| val_bpb | 0.7319 | 0.724 | +0.008 (LOSE) |
+| CORE | **0.2434** | **0.2694** | **−0.026 (big LOSE)** |
+| wall-clock | 98 min | 88 min | +10 min (LOSE) |
+
+Config delta from v73: `--max-seq-len=1024 --device-batch-size=32` (total_batch=1M held constant).
+
+**Finding**: The d12→d22 transfer assumption fails for seq length. Shorter seq at d22 costs ~0.026 CORE and runs slower (memory-bound batch larger). Consistent with v107-era finding that wider/deeper benefits scale non-linearly with seq. At d22 the full 2048 context matters for CORE tasks (HellaSwag, ARC, etc. reward long-context reasoning).
+
+**Conclusion**: stop chasing d12 wins at d22. The recipe space around v73 is truly saturated on single-knob axes.
+
+### 2026-04-22 evening — v137: data-reuse via `--max-train-shards=3`
+
+Exhausted hyperparams; exhausted single-knob scale tweaks. Now moving to **data-level** levers per paper 2506.12119 §6 ("data reuse beats data diversity in small-compute regimes").
+
+v73 baseline sees ~3.1B tokens across 6 train shards (one pass). v137 caps to 3 shards → same iter budget → ~2× epoch cycling on a curated subset. If data reuse helps here, CORE should beat 0.2694 at matched wall-clock.
+
+Hypothesis: data reuse > data diversity at 6000-iter d22 scale. If confirmed, this motivates trying curated-top-quality shards next.
+
+Launched: `rs_v137_d22_maxshards3_6000`. Values file: `values.d22_maxshards3.yaml`.
+
