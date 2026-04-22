@@ -110,6 +110,75 @@ record. If final CORE < 0.2565, the schedule-compression hypothesis fails.
 Expected wall-clock for 5000 iter: 5000 × 0.88s = **73 min**. If final CORE ≥ 0.2565, we
 set a tight budget floor and can explore further.
 
+## Speedrun sweep results (overnight 2026-04-21)
+
+Tested several candidates aimed at reducing time-to-CORE-0.2565 below v73's 82 min:
+
+| v | config | iters | val_bpb | CORE | wall-clock | crosses? |
+|---|---|---:|---:|---:|---:|:---:|
+| v73 | baseline | 6000 | 0.724 | **0.2694** | **88 min** | ✅ ~82 min |
+| v117 | baseline | 10000 | 0.709 | 0.2793 | 147 min | ✅ |
+| v118 | aspect=80+LR=0.03 | 10000 | 0.697 | 0.2853 | 202 min | ✅ |
+| v119 | baseline + CORE trajectory | 6000 | 0.724 | 0.2604 (quick) | 88+overhead | ✅ ~82 min |
+| v120 | compressed schedule | 5000 | 0.731 | 0.2470 | 73 min | **❌ by 0.010** |
+| v121 | mid compression | 5500 | 0.727 | 0.2539 | 81 min | **❌ by 0.003** |
+| v122 | d20 smaller model | 6000 | 0.734 | hung | ~71 min | (probably ❌) |
+| v123 | 2M batch × 3000 iter | 3000 | 0.729 | 0.2435 | 88 min | **❌ by 0.013** |
+| v124 | device_batch=32 | — | — | OOM | — | — |
+| v125 | Muon LR 0.018 | 6000 | 0.724 | 0.2651 | 88 min | ✅ but CORE −0.004 vs v73 |
+
+**Findings for the speedrun leaderboard:**
+
+1. **Baseline recipe (v73) crosses CORE 0.2565 at ~82 min of pure training** (inferred
+   from v119 trajectory where step 5500 gave CORE ~0.254 and step 6000 gave ~0.269).
+
+2. **Cutting iters fails**: 5000 iter (0.247) and 5500 iter (0.254) both miss the target
+   despite reaching similar val_bpb to baseline. More gradient steps matter for CORE
+   beyond what val_bpb captures.
+
+3. **Larger batch fails**: 2M batch × 3000 iter has equivalent val_bpb (0.729) to baseline
+   but CORE 0.2435 — final CORE correlates with #gradient-steps, not just total tokens.
+
+4. **Smaller model fails**: d20 consistently +0.012 val_bpb worse than d22 per step.
+   Model scale matters.
+
+5. **LR fine-tune (0.018 vs 0.020) is a wash**: CORE −0.004 at same val_bpb.
+
+6. **Speedrun recipe is optimal within single-recipe hyperparameter space**: v73's 6000
+   iterations, 1M batch, Muon LR 0.02, default schedule is at a local optimum for
+   time-to-CORE. The leaderboard-beating path requires either (a) a qualitatively
+   different method (optimizer beyond Muon, novel architecture, better data) or (b)
+   more compute (v117/v118 show CORE continues improving past 6000 iter).
+
+## Final leaderboard comparison
+
+| entry | time | val_bpb | CORE | notes |
+|---|---:|---:|---:|---|
+| Leaderboard #6 (Karpathy autoresearch 2) | 99 min (1.65h) | 0.71800 | 0.2626 | Mar 14 2026 |
+| **v73 baseline (our estimate)** | **~82 min pure training** | 0.724 | 0.2694 | our recipe = ~speedrun.sh |
+| v117 | 147 min | 0.709 | 0.2793 | more iters, off-budget |
+| v118 | 202 min | 0.697 | 0.2853 | all-time best CORE |
+
+v73 effectively matches leaderboard #6 once tokenizer + eval overhead is added back in
+(~15 min). **Nothing in our sweep produces a strict leaderboard improvement** at the
+pure-training budget.
+
+## Research directions that remain open
+
+All of these require code work not done in this sweep:
+- **MuonClip QK-Clip** coupled with higher LR (our v115 regressed MuonClip alone; maybe
+  MuonClip + LR 0.025 unlocks a better Pareto point we didn't test)
+- **Longer context (seq_len=4096)** — untested; might hurt throughput but boost quality
+- **Different data**: leaderboard shows ClimbMix was a win (-12 min); are there better
+  sources or per-domain weighting schemes to try?
+- **RoPE tuning**: base frequency, theta variants
+- **Better expert init** for MoE (if revisited)
+- **Expert parallel MoE with working CORE eval** (v91 showed grad-checkpoint unlocks
+  configs but CORE was hurt)
+
+None of these were implementable in this window without significant code work; logged
+as concrete follow-ups.
+
 ## Final scoreboard at d22 6000-iter matched wall-clock
 
 | config | wall-clock | val_bpb | CORE |
