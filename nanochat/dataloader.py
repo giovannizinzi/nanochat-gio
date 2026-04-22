@@ -182,13 +182,14 @@ def tokenizing_distributed_data_loader_with_state_bos_bestfit(
         if emit_doc_lens:
             # Pad each row's segment list to the batch-wide max, then stack.
             # Segments sum to row_capacity=T+1; after input[:,:-1]/target[:,1:] slicing we
-            # interpret boundaries against the length-T inputs. Last segment is truncated
-            # by 1 to match the T-1 target positions; we handle that downstream.
+            # interpret boundaries against the length-T inputs.
+            # Build on CPU then blocking-copy to device — non_blocking from unpinned memory
+            # confuses torch.compile's fake-tensor propagation (device attribution is lost).
             max_segs = max(len(s) for s in per_row_segments)
-            padded = torch.zeros((B, max_segs), dtype=torch.int32)
+            padded_cpu = torch.zeros((B, max_segs), dtype=torch.int32)
             for i, segs in enumerate(per_row_segments):
-                padded[i, :len(segs)] = torch.tensor(segs, dtype=torch.int32)
-            doc_lens = padded.to(device=device, non_blocking=use_cuda) if use_cuda else padded
+                padded_cpu[i, :len(segs)] = torch.tensor(segs, dtype=torch.int32)
+            doc_lens = padded_cpu.to(device=device) if use_cuda else padded_cpu
             yield inputs, targets, state_dict, doc_lens
         else:
             yield inputs, targets, state_dict

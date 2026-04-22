@@ -605,7 +605,8 @@ class GPT(nn.Module):
         # Result: same_doc (B, T, T) bool, True where query pos q_i and key pos k_j share a doc.
         doc_mask = None
         if doc_lens is not None and kv_cache is None:
-            cum = doc_lens.to(torch.int32).cumsum(dim=-1)  # (B, max_segs)
+            doc_lens = doc_lens.to(device=idx.device, dtype=torch.int32)  # defensive: ensure aligned with idx
+            cum = doc_lens.cumsum(dim=-1).to(torch.int32)  # (B, max_segs); cumsum upcasts to int64 by default
             positions = torch.arange(T, device=idx.device, dtype=torch.int32)  # (T,)
             # doc_id[b, p] = number of segment-end positions <= p; equivalently, the segment index
             # containing position p. Broadcast: (1, T, 1) >= (B, 1, max_segs) -> (B, T, max_segs).
