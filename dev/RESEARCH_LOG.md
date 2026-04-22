@@ -179,6 +179,21 @@ All of these require code work not done in this sweep:
 None of these were implementable in this window without significant code work; logged
 as concrete follow-ups.
 
+## Additional attempts (post-summary) — nothing moves the needle
+
+| v | config | val_bpb | CORE | vs baseline |
+|---|---|---:|---:|---:|
+| v126 | MuonClip + Muon LR 0.025 | (killed) | — | trailing +0.003 at step 2000, killed early |
+| v127 | warmdown-ratio=0.75 | 0.724 | 0.2509 | **−0.019 CORE** |
+
+Baseline warmdown=0.65 is the right point. Going to 0.75 or 0.85 (v116, −0.011)
+both regress CORE despite identical val_bpb. Same pattern as all other hyperparameter
+changes — val_bpb tracks baseline, CORE drops.
+
+Fully out of ideas in the hyperparameter space. **Baseline recipe (Muon LR 0.02,
+warmdown 0.65, warmup 40, weight-decay 0.28, device batch 16, total batch 1M,
+6000 iter, d22, FP8) is the speedrun champion at 82-88 min.**
+
 ## Final scoreboard at d22 6000-iter matched wall-clock
 
 | config | wall-clock | val_bpb | CORE |
