@@ -80,7 +80,8 @@ def tokenizing_distributed_data_loader_with_state_bos_bestfit(
     tokenizer, B, T, split,
     tokenizer_threads=4, tokenizer_batch_size=128,
     device="cuda", resume_state_dict=None,
-    buffer_size=1000, max_train_shards=-1
+    buffer_size=1000, max_train_shards=-1,
+    emit_doc_lens=False,
 ):
     """
     BOS-aligned dataloader with Best-Fit Cropping.
@@ -124,7 +125,17 @@ def tokenizing_distributed_data_loader_with_state_bos_bestfit(
     inputs = gpu_buffer[:B * T].view(B, T)
     targets = gpu_buffer[B * T:].view(B, T)
 
+    # Per-row doc segment lengths (for cross-doc attention masking). Only tracked when
+    # emit_doc_lens=True, since the general training path uses plain causal attention.
+    # A segment here is a packed document within a row (or the cropped tail when no doc fits).
+    # Segments are in-row order, so their cumulative sum gives BOS positions within the row.
+    per_row_segments = [[] for _ in range(B)] if emit_doc_lens else None
+
     while True:
+        if emit_doc_lens:
+            for segs in per_row_segments:
+                segs.clear()
+
         for row_idx in range(B):
             pos = 0
             while pos < row_capacity:
@@ -147,12 +158,16 @@ def tokenizing_distributed_data_loader_with_state_bos_bestfit(
                     doc = doc_buffer.pop(best_idx)
                     doc_len = len(doc)
                     row_buffer[row_idx, pos:pos + doc_len] = torch.tensor(doc, dtype=torch.long)
+                    if emit_doc_lens:
+                        per_row_segments[row_idx].append(doc_len)
                     pos += doc_len
                 else:
                     # No doc fits - crop shortest in buffer to fill remaining and minimize waste
                     shortest_idx = min(range(len(doc_buffer)), key=lambda i: len(doc_buffer[i]))
                     doc = doc_buffer.pop(shortest_idx)
                     row_buffer[row_idx, pos:pos + remaining] = torch.tensor(doc[:remaining], dtype=torch.long)
+                    if emit_doc_lens:
+                        per_row_segments[row_idx].append(remaining)
                     pos += remaining
 
         # Copy to pinned CPU buffer, then single HtoD transfer
@@ -163,9 +178,28 @@ def tokenizing_distributed_data_loader_with_state_bos_bestfit(
 
         # Single HtoD copy into persistent GPU buffer and yield
         gpu_buffer.copy_(cpu_buffer, non_blocking=use_cuda)
-        yield inputs, targets, state_dict
+
+        if emit_doc_lens:
+            # Pad each row's segment list to the batch-wide max, then stack.
+            # Segments sum to row_capacity=T+1; after input[:,:-1]/target[:,1:] slicing we
+            # interpret boundaries against the length-T inputs. Last segment is truncated
+            # by 1 to match the T-1 target positions; we handle that downstream.
+            max_segs = max(len(s) for s in per_row_segments)
+            padded = torch.zeros((B, max_segs), dtype=torch.int32)
+            for i, segs in enumerate(per_row_segments):
+                padded[i, :len(segs)] = torch.tensor(segs, dtype=torch.int32)
+            doc_lens = padded.to(device=device, non_blocking=use_cuda) if use_cuda else padded
+            yield inputs, targets, state_dict, doc_lens
+        else:
+            yield inputs, targets, state_dict
 
 def tokenizing_distributed_data_loader_bos_bestfit(*args, **kwargs):
     """Helper that omits state_dict from yields."""
-    for inputs, targets, state_dict in tokenizing_distributed_data_loader_with_state_bos_bestfit(*args, **kwargs):
-        yield inputs, targets
+    emit_doc_lens = kwargs.get("emit_doc_lens", False)
+    for out in tokenizing_distributed_data_loader_with_state_bos_bestfit(*args, **kwargs):
+        if emit_doc_lens:
+            inputs, targets, _, doc_lens = out
+            yield inputs, targets, doc_lens
+        else:
+            inputs, targets, _ = out
+            yield inputs, targets

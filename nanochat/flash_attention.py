@@ -104,7 +104,25 @@ def _sdpa_attention(q, k, v, window_size, enable_gqa):
 # =============================================================================
 # Public API: Same interface as FA3
 # =============================================================================
-def flash_attn_func(q, k, v, causal=False, window_size=(-1, -1)):
+def _sdpa_with_doc_mask(q, k, v, window_size, same_doc_mask, enable_gqa):
+    """SDPA with causal + sliding-window + cross-doc blocking combined into one mask.
+    q, k, v: (B, H, T, D). same_doc_mask: (B, T, T) bool, True where i,j are in same packed doc.
+    Used only when --doc-mask is on. Forces SDPA even on H100 — slower than FA3 but simpler
+    than building the varlen variant; good enough for 2000-iter validation runs.
+    """
+    T = q.size(2)
+    device = q.device
+    window = window_size[0]
+    idx = torch.arange(T, device=device)
+    causal = idx[:, None] >= idx[None, :]  # (T, T) True at allowed (q_pos, k_pos)
+    mask = causal
+    if window >= 0 and window < T:
+        mask = mask & ((idx[:, None] - idx[None, :]) < window + 1)  # sliding window
+    full = same_doc_mask & mask[None, :, :]  # (B, T, T)
+    return F.scaled_dot_product_attention(q, k, v, attn_mask=full.unsqueeze(1), enable_gqa=enable_gqa)
+
+
+def flash_attn_func(q, k, v, causal=False, window_size=(-1, -1), doc_mask=None):
     """
     Flash Attention for training (no KV cache).
 
@@ -112,10 +130,23 @@ def flash_attn_func(q, k, v, causal=False, window_size=(-1, -1)):
         q, k, v: Tensors of shape (B, T, H, D)
         causal: Whether to use causal masking
         window_size: (left, right) sliding window. -1 means unlimited.
+        doc_mask: optional (B, T, T) bool tensor, True where keys/queries are in the same
+            packed document. When provided, forces the SDPA path with combined masking
+            (causal + sliding window + cross-doc blocking). FA3 varlen would be faster but
+            is deferred until the validation run confirms the mask helps.
 
     Returns:
         Output tensor of shape (B, T, H, D)
     """
+    if doc_mask is not None:
+        assert causal, "doc_mask implies causal attention"
+        q_t = q.transpose(1, 2)
+        k_t = k.transpose(1, 2)
+        v_t = v.transpose(1, 2)
+        enable_gqa = q_t.size(1) != k_t.size(1)
+        y = _sdpa_with_doc_mask(q_t, k_t, v_t, window_size, doc_mask, enable_gqa)
+        return y.transpose(1, 2)
+
     if USE_FA3:
         return _fa3.flash_attn_func(q, k, v, causal=causal, window_size=window_size)
 

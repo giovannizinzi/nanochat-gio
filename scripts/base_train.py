@@ -73,6 +73,7 @@ parser.add_argument("--ffn-type", type=str, default="relu2", choices=["relu2", "
 # Logit z-loss (PaLM)
 parser.add_argument("--z-loss-coef", type=float, default=0.0, help="PaLM-style logit z-loss coefficient (arxiv 2204.02311 §5). 0.0 = disabled (default, bit-identical). Typical: 1e-4.")
 parser.add_argument("--max-train-shards", type=int, default=-1, help="cap training parquet shards to first N (enables data reuse / multi-epoch training; arxiv 2506.12119 §6)")
+parser.add_argument("--doc-mask", action="store_true", help="mask attention across packed-document boundaries in each row. Fixes train/test mismatch where ~4 docs/row leak across the causal mask. Forces SDPA path (slower than FA3); validate effect at small scale before committing to FA3 varlen port.")
 # Training horizon (only one used, in order of precedence)
 parser.add_argument("--num-iterations", type=int, default=-1, help="explicit number of optimization steps (-1 = disable)")
 parser.add_argument("--target-flops", type=float, default=-1.0, help="calculate num_iterations to reach target_flops (-1 = disable)")
@@ -369,9 +370,13 @@ if scaler is not None:
 # -----------------------------------------------------------------------------
 # Initialize the DataLoaders for train/val
 dataloader_resume_state_dict = None if not resuming else meta_data["dataloader_state_dict"]
-train_loader = tokenizing_distributed_data_loader_with_state_bos_bestfit(tokenizer, args.device_batch_size, args.max_seq_len, split="train", device=device, resume_state_dict=dataloader_resume_state_dict, max_train_shards=args.max_train_shards)
-build_val_loader = lambda: tokenizing_distributed_data_loader_bos_bestfit(tokenizer, args.device_batch_size, args.max_seq_len, split="val", device=device)
-x, y, dataloader_state_dict = next(train_loader) # kick off load of the very first batch of data
+train_loader = tokenizing_distributed_data_loader_with_state_bos_bestfit(tokenizer, args.device_batch_size, args.max_seq_len, split="train", device=device, resume_state_dict=dataloader_resume_state_dict, max_train_shards=args.max_train_shards, emit_doc_lens=args.doc_mask)
+build_val_loader = lambda: tokenizing_distributed_data_loader_bos_bestfit(tokenizer, args.device_batch_size, args.max_seq_len, split="val", device=device, emit_doc_lens=args.doc_mask)
+if args.doc_mask:
+    x, y, dataloader_state_dict, doc_lens = next(train_loader) # kick off load of the very first batch of data
+else:
+    x, y, dataloader_state_dict = next(train_loader) # kick off load of the very first batch of data
+    doc_lens = None
 
 # -----------------------------------------------------------------------------
 # Calculate the number of iterations we will train for and set up the various schedulers
@@ -550,7 +555,7 @@ while True:
     t0 = time.time()
     aux_loss_accum = 0.0  # accumulate aux loss across micro-steps for logging
     for micro_step in range(grad_accum_steps):
-        ce_loss, aux_loss = model(x, y)
+        ce_loss, aux_loss = model(x, y, doc_lens=doc_lens)
         total_loss = ce_loss + aux_loss  # MoE aux flows into backward; aux is 0 for dense
         train_loss = ce_loss.detach()  # for logging, CE only (comparable across dense/MoE)
         aux_loss_accum += aux_loss.detach()
@@ -559,7 +564,10 @@ while True:
             scaler.scale(total_loss).backward()
         else:
             total_loss.backward()
-        x, y, dataloader_state_dict = next(train_loader) # prefetch the next batch while the GPU is busy with forward/backward
+        if args.doc_mask:
+            x, y, dataloader_state_dict, doc_lens = next(train_loader)
+        else:
+            x, y, dataloader_state_dict = next(train_loader)
     # step the optimizer
     lrm = get_lr_multiplier(step)
     muon_momentum = get_muon_momentum(step)

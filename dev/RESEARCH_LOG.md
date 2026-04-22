@@ -331,13 +331,27 @@ Config delta from v73: `--max-seq-len=1024 --device-batch-size=32` (total_batch=
 
 **Conclusion**: stop chasing d12 wins at d22. The recipe space around v73 is truly saturated on single-knob axes.
 
-### 2026-04-22 evening — v137: data-reuse via `--max-train-shards=3`
+### 2026-04-22 evening — v137 killed; pivot to principled correctness fix
 
-Exhausted hyperparams; exhausted single-knob scale tweaks. Now moving to **data-level** levers per paper 2506.12119 §6 ("data reuse beats data diversity in small-compute regimes").
+Initial plan was v137 = `--max-train-shards=3` (multi-epoch on subset, paper 2506.12119 §6). **Killed before meaningful training**: this is a regime-specific trick that trades generalization for CORE-at-6000-iter. Multi-epoch on a narrower slice is textbook overfitting — it inflates a specific-compute metric at the cost of validation generalization. Not a recipe improvement worth pursuing.
 
-v73 baseline sees ~3.1B tokens across 6 train shards (one pass). v137 caps to 3 shards → same iter budget → ~2× epoch cycling on a curated subset. If data reuse helps here, CORE should beat 0.2694 at matched wall-clock.
+Pivot: **cross-doc attention masking** as a correctness fix. The current BOS-bestfit dataloader packs multiple docs per row; the causal mask has no notion of doc boundaries; Doc-N tokens attend to unrelated Doc-(N-1) context. That's a train/test mismatch (at inference the model never sees packed cross-doc context) and a form of training-signal noise.
 
-Hypothesis: data reuse > data diversity at 6000-iter d22 scale. If confirmed, this motivates trying curated-top-quality shards next.
+### 2026-04-22 — Docs-per-row measurement (v138 BENCH_MODE)
 
-Launched: `rs_v137_d22_maxshards3_6000`. Values file: `values.d22_maxshards3.yaml`.
+Before committing ~80 LOC to the FA3 varlen refactor, measured effect-size ceiling. `scripts/bench_docs_per_row.py` replays the BOS-bestfit packing on real ClimbMix shard 0, T=2048, 4096 rows.
+
+| metric | value |
+|---|---|
+| docs_per_row | mean=3.94, p50=3, p90=6, p99=11, max=13 |
+| bos_per_row | mean=3.94 (matches — each packed doc gets exactly one BOS) |
+| crop_rate | **1.53%** tokens discarded (not 35% per the old docstring) |
+| doc_length_tokens | mean=528, p50=538, p90=835, p99=1693 |
+
+**Findings**:
+1. **Cross-doc contamination is real** — median row packs 3 docs, 20% of rows pack 5+. Every training step, most tokens attend across unrelated docs. Inference never does this → explicit train/test mismatch.
+2. **Token-recovery intervention is dead** — crop rate is 1.53%, not the 35% the docstring warned about. Best-fit + buffer=1000 is already near-optimal; nothing to recover.
+3. **Expected magnitude of doc-mask fix**: moderate. Papers report +0.3-0.5 CORE from BFD+mask combined, but they bundle packing gains. Since our packing is already efficient, we only capture the mask piece → realistic expectation +0.1 to +0.3 CORE.
+
+**Next**: implement `--doc-mask` via FA3 `flash_attn_varlen_func` + cu_seqlens. Validate at d12 2000-iter before scaling to d22.
 

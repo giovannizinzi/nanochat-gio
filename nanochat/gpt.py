@@ -117,7 +117,7 @@ class CausalSelfAttention(nn.Module):
         self.ve_gate_channels = 12
         self.ve_gate = Linear(self.ve_gate_channels, self.n_kv_head, bias=False) if has_ve(layer_idx, config.n_layer) else None
 
-    def forward(self, x, ve, cos_sin, window_size, kv_cache):
+    def forward(self, x, ve, cos_sin, window_size, kv_cache, doc_mask=None):
         B, T, C = x.size()
 
         # Project the input to get queries, keys, and values
@@ -142,8 +142,9 @@ class CausalSelfAttention(nn.Module):
         # Flash Attention (FA3 on Hopper+, PyTorch SDPA fallback elsewhere)
         # window_size is (left, right) tuple: (N, 0) for causal, (-1, 0) for full context
         if kv_cache is None:
-            # Training: causal attention with optional sliding window
-            y = flash_attn.flash_attn_func(q, k, v, causal=True, window_size=window_size)
+            # Training: causal attention with optional sliding window. When doc_mask is
+            # provided, flash_attn_func forces the SDPA path with cross-doc blocking added.
+            y = flash_attn.flash_attn_func(q, k, v, causal=True, window_size=window_size, doc_mask=doc_mask)
         else:
             # Inference: use flash_attn_with_kvcache which handles cache management
             k_cache, v_cache = kv_cache.get_layer_cache(self.layer_idx)
@@ -215,8 +216,8 @@ class Block(nn.Module):
         self.use_moe = config.num_experts > 1 and layer_idx >= config.moe_first_layer
         self.mlp = MoE(config) if self.use_moe else MLP(config)
 
-    def forward(self, x, ve, cos_sin, window_size, kv_cache):
-        x = x + self.attn(norm(x), ve, cos_sin, window_size, kv_cache)
+    def forward(self, x, ve, cos_sin, window_size, kv_cache, doc_mask=None):
+        x = x + self.attn(norm(x), ve, cos_sin, window_size, kv_cache, doc_mask=doc_mask)
         if self.use_moe:
             mlp_out, aux = self.mlp(norm(x))
             x = x + mlp_out
@@ -595,8 +596,21 @@ class GPT(nn.Module):
             group["initial_lr"] = group["lr"]
         return optimizer
 
-    def forward(self, idx, targets=None, kv_cache=None, loss_reduction='mean'):
+    def forward(self, idx, targets=None, kv_cache=None, loss_reduction='mean', doc_lens=None):
         B, T = idx.size()
+
+        # Build per-batch same-document mask from doc_lens if provided.
+        # doc_lens: (B, max_segs) int32, segment lengths summing to row_capacity (T+1 from dataloader).
+        # We interpret boundaries against the length-T `idx` view (row[:, :-1] in the dataloader).
+        # Result: same_doc (B, T, T) bool, True where query pos q_i and key pos k_j share a doc.
+        doc_mask = None
+        if doc_lens is not None and kv_cache is None:
+            cum = doc_lens.to(torch.int32).cumsum(dim=-1)  # (B, max_segs)
+            positions = torch.arange(T, device=idx.device, dtype=torch.int32)  # (T,)
+            # doc_id[b, p] = number of segment-end positions <= p; equivalently, the segment index
+            # containing position p. Broadcast: (1, T, 1) >= (B, 1, max_segs) -> (B, T, max_segs).
+            doc_id = (positions[None, :, None] >= cum[:, None, :]).sum(dim=-1)  # (B, T)
+            doc_mask = (doc_id[:, :, None] == doc_id[:, None, :])  # (B, T, T), True where same doc
 
         # Grab the rotary embeddings for the current sequence length (they are of shape (1, seq_len, 1, head_dim/2))
         assert T <= self.cos.size(1), f"Sequence length grew beyond the rotary embeddings cache: {T} > {self.cos.size(1)}"
@@ -640,7 +654,7 @@ class GPT(nn.Module):
         for i, block in enumerate(self.transformer.h):
             x = self.resid_lambdas[i] * x + self.x0_lambdas[i] * x0
             ve = self.value_embeds[str(i)](idx).to(x.dtype) if str(i) in self.value_embeds else None
-            x, block_aux = block(x, ve, cos_sin, self.window_sizes[i], kv_cache)
+            x, block_aux = block(x, ve, cos_sin, self.window_sizes[i], kv_cache, doc_mask=doc_mask)
             aux_loss_total = aux_loss_total + block_aux
             if i == backout_layer:
                 x_backout = x
