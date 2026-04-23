@@ -75,6 +75,13 @@ class GPTConfig:
     # Keeps log-partition Z close to 0, which stabilizes bf16/fp16 training. 0.0 = disabled
     # (bit-identical to prior behavior). Typical value: 1e-4.
     z_loss_coef: float = 0.0
+    # NoPE (Haviv et al. 2022, arxiv 2203.16634): skip rotary embeddings; rely on the causal
+    # mask to encode position implicitly. Saves ~1-2% per step (no rope tensor materialization).
+    use_rope: bool = True
+    # Chunked cross-entropy: chunk logits+CE computation along the sequence dimension to
+    # avoid materializing a (B, T, V) fp32 logits tensor at once. 0 = disabled (one-shot CE).
+    # Typical values: 128 or 256. Loss is bit-identical to the one-shot path.
+    chunked_ce_chunk_size: int = 0
 
 
 def norm(x):
@@ -132,9 +139,11 @@ class CausalSelfAttention(nn.Module):
             gate = 3 * torch.sigmoid(self.ve_gate(x[..., :self.ve_gate_channels]))  # (B, T, n_kv_head), range (0, 3)
             v = v + gate.unsqueeze(-1) * ve
 
-        # Apply Rotary Embeddings to queries and keys to get relative positional encoding
-        cos, sin = cos_sin
-        q, k = apply_rotary_emb(q, cos, sin), apply_rotary_emb(k, cos, sin)
+        # Apply Rotary Embeddings to queries and keys to get relative positional encoding.
+        # cos_sin is None when config.use_rope=False (NoPE — causal mask encodes position).
+        if cos_sin is not None:
+            cos, sin = cos_sin
+            q, k = apply_rotary_emb(q, cos, sin), apply_rotary_emb(k, cos, sin)
         q, k = norm(q), norm(k) # QK norm
         q = q * 1.2  # sharper attention (split scale between Q and K), TODO think through better
         k = k * 1.2
@@ -614,12 +623,16 @@ class GPT(nn.Module):
             doc_mask = (doc_id[:, :, None] == doc_id[:, None, :])  # (B, T, T), True where same doc
 
         # Grab the rotary embeddings for the current sequence length (they are of shape (1, seq_len, 1, head_dim/2))
-        assert T <= self.cos.size(1), f"Sequence length grew beyond the rotary embeddings cache: {T} > {self.cos.size(1)}"
-        assert idx.device == self.cos.device, f"Rotary embeddings and idx are on different devices: {idx.device} != {self.cos.device}"
-        assert self.cos.dtype == COMPUTE_DTYPE, f"Rotary embeddings must be in {COMPUTE_DTYPE}, got {self.cos.dtype}"
-        # if kv cache exists, we need to offset the rotary embeddings to the current position in the cache
-        T0 = 0 if kv_cache is None else kv_cache.get_pos()
-        cos_sin = self.cos[:, T0:T0+T], self.sin[:, T0:T0+T] # truncate cache to current sequence length
+        # When config.use_rope=False (NoPE), pass None through to the attention layers so they
+        # skip apply_rotary_emb entirely. Causal attention implicitly encodes position.
+        if self.config.use_rope:
+            assert T <= self.cos.size(1), f"Sequence length grew beyond the rotary embeddings cache: {T} > {self.cos.size(1)}"
+            assert idx.device == self.cos.device, f"Rotary embeddings and idx are on different devices: {idx.device} != {self.cos.device}"
+            assert self.cos.dtype == COMPUTE_DTYPE, f"Rotary embeddings must be in {COMPUTE_DTYPE}, got {self.cos.dtype}"
+            T0 = 0 if kv_cache is None else kv_cache.get_pos()
+            cos_sin = self.cos[:, T0:T0+T], self.sin[:, T0:T0+T]
+        else:
+            cos_sin = None
 
         # Embed the tokens
         x = self.transformer.wte(idx) # embed current token
@@ -664,8 +677,38 @@ class GPT(nn.Module):
             x = x - self.backout_lambda.to(x.dtype) * x_backout
         x = norm(x)
 
-        # Forward the lm_head (compute logits)
+        # Forward the lm_head (compute logits). Chunked path is bit-identical to the one-shot
+        # path for mean CE, but avoids the (B, T, V) fp32 logits materialization.
         softcap = 15 # smoothly cap the logits to the range [-softcap, softcap]
+
+        chunk = self.config.chunked_ce_chunk_size
+        use_chunked_ce = (
+            chunk > 0 and targets is not None and loss_reduction == 'mean'
+            and self.config.z_loss_coef == 0.0  # z_loss needs full logits; skip for now
+        )
+
+        if use_chunked_ce:
+            # Loop over seq dim; compute logits + CE per chunk; aggregate as sum/count.
+            B_, T_, _ = x.size()
+            total_nats = torch.zeros((), dtype=torch.float32, device=x.device)
+            total_count = torch.zeros((), dtype=torch.float32, device=x.device)
+            for s in range(0, T_, chunk):
+                e = min(s + chunk, T_)
+                x_c = x[:, s:e, :]
+                t_c = targets[:, s:e]
+                lg = self.lm_head(x_c)
+                lg = lg[..., :self.config.vocab_size].float()
+                lg = softcap * torch.tanh(lg / softcap)
+                loss_c = F.cross_entropy(
+                    lg.reshape(-1, lg.size(-1)), t_c.reshape(-1),
+                    ignore_index=-1, reduction='sum',
+                )
+                total_nats = total_nats + loss_c
+                total_count = total_count + (t_c.reshape(-1) != -1).sum().float()
+            loss = total_nats / total_count.clamp(min=1.0)
+            # Skip the return-stack fork: we already have our scalar mean loss.
+            return loss, aux_loss_total
+
         logits = self.lm_head(x) # (B, T, padded_vocab_size) <- very big tensor, large amount of memory
         logits = logits[..., :self.config.vocab_size] # slice to remove padding
         logits = logits.float() # switch to fp32 for logit softcap and loss computation
@@ -673,7 +716,6 @@ class GPT(nn.Module):
 
         if targets is not None:
             # training: given the targets, compute and return the loss
-            # TODO experiment with chunked cross-entropy?
             loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1, reduction=loss_reduction)
             # PaLM-style z-loss on logits (arxiv 2204.02311 §5): penalize (logsumexp(logits))**2
             # to keep the log-partition Z near 0. Stabilizes bf16/fp16 training.

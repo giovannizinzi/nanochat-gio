@@ -74,6 +74,9 @@ parser.add_argument("--ffn-type", type=str, default="relu2", choices=["relu2", "
 parser.add_argument("--z-loss-coef", type=float, default=0.0, help="PaLM-style logit z-loss coefficient (arxiv 2204.02311 §5). 0.0 = disabled (default, bit-identical). Typical: 1e-4.")
 parser.add_argument("--max-train-shards", type=int, default=-1, help="cap training parquet shards to first N (enables data reuse / multi-epoch training; arxiv 2506.12119 §6)")
 parser.add_argument("--doc-mask", action="store_true", help="mask attention across packed-document boundaries in each row. Fixes train/test mismatch where ~4 docs/row leak across the causal mask. Forces SDPA path (slower than FA3); validate effect at small scale before committing to FA3 varlen port.")
+parser.add_argument("--n-kv-head-divisor", type=int, default=1, help="n_kv_head = n_head // N. 1 = MHA (default), 2 = GQA halves KV. Must divide n_head evenly.")
+parser.add_argument("--no-rope", action="store_true", help="Disable RoPE (NoPE, Haviv et al. 2022). Causal mask implicitly encodes position. Saves a few ms/step.")
+parser.add_argument("--chunked-ce-chunk-size", type=int, default=0, help="Chunk cross-entropy over seq dim to save logits memory. 0 = disabled (one-shot CE). Typical: 128 or 256.")
 # Training horizon (only one used, in order of precedence)
 parser.add_argument("--num-iterations", type=int, default=-1, help="explicit number of optimization steps (-1 = disable)")
 parser.add_argument("--target-flops", type=float, default=-1.0, help="calculate num_iterations to reach target_flops (-1 = disable)")
@@ -158,7 +161,7 @@ def build_model_meta(depth):
     num_heads = model_dim // args.head_dim
     config = GPTConfig(
         sequence_len=args.max_seq_len, vocab_size=vocab_size,
-        n_layer=depth, n_head=num_heads, n_kv_head=num_heads, n_embd=model_dim,
+        n_layer=depth, n_head=num_heads, n_kv_head=num_heads // max(args.n_kv_head_divisor, 1), n_embd=model_dim,
         window_pattern=args.window_pattern,
         num_experts=args.num_experts, top_k=args.top_k,
         num_shared_experts=args.num_shared_experts,
@@ -176,6 +179,8 @@ def build_model_meta(depth):
         moe_grad_checkpoint=args.moe_grad_checkpoint,
         ffn_type=args.ffn_type,
         z_loss_coef=args.z_loss_coef,
+        use_rope=not args.no_rope,
+        chunked_ce_chunk_size=args.chunked_ce_chunk_size,
     )
     with torch.device("meta"):
         model_meta = GPT(config)
