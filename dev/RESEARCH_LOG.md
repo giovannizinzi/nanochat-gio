@@ -355,3 +355,82 @@ Before committing ~80 LOC to the FA3 varlen refactor, measured effect-size ceili
 
 **Next**: implement `--doc-mask` via FA3 `flash_attn_varlen_func` + cu_seqlens. Validate at d12 2000-iter before scaling to d22.
 
+### 2026-04-22 late evening — doc-mask v1 A/B at d12 2000-iter: WEAK SIGNAL
+
+Implemented cross-doc attention masking (mask-only, SDPA path, no RoPE reset, ~130 LOC). v1 scoped intentionally narrow: FA3 varlen port deferred.
+
+| run | config | val_bpb | CORE@500 | runtime |
+|---|---|---|---|---|
+| v142 (OFF) | baseline FA3 | 0.8609 | 0.1373 | 4.5 min |
+| v143 (ON)  | SDPA + doc-mask | 0.8612 | 0.1456 | 8.7 min (2x slower) |
+
+val_bpb: essentially equal (+0.0003, noise). CORE: +0.008 (borderline, 500-sample noisy).
+
+**Verdict**: **weak signal, not worth the 2x SDPA slowdown**. Hypothesis was "mask fixes training-signal noise → lower val_bpb"; val_bpb didn't move. CORE improvement is within 500-sample noise envelope. Signal too small to justify FA3 varlen port + RoPE position-reset v2. Deprioritizing.
+
+### 2026-04-22 overnight — autonomous loop at d12 2000-iter
+
+Rule: edit → commit → launch → if (val_bpb OR CORE improved vs baseline v142 0.8609/0.1373) keep commit, else reset. Arg-only experiments don't touch git.
+
+Noise envelopes: val_bpb ~0.003, CORE@500 ~0.01. Clear wins need >= those deltas.
+
+| exp | config delta | val_bpb | CORE@500 | runtime | verdict |
+|---|---|---|---|---|---|
+| v142 | baseline | 0.8609 | 0.1373 | 7.2 min | anchor |
+| v144 E1 | +z-loss=1e-4 | 0.8659 | 0.1439 | 4.8m | mixed (bpb worse, CORE in-noise). Skip. |
+| v145 E2 | softcap 15→30 (CODE) | 0.8621 | 0.1347 | 4.5m | both worse. RESET to 58842ff. |
+| v146 E3 | +unembed-lr=0.016 | 0.8626 | 0.1432 | 4.5m | both in-noise. Skip. |
+| v147 E4 | +matrix-lr=0.025 | 0.8606 | **0.1498** | 7.1m | CORE +0.013, val_bpb flat. Keep as candidate. |
+| v148 E5 | warmdown 0.65→0.50 | 0.8613 | 0.1366 | ? | noise. Skip. |
+| v149 E6 | warmdown 0.65→0.75 | 0.8614 | 0.1455 | ? | CORE +0.008 borderline. Skip. |
+| v150 E7 | warmup-steps 40→20 | 0.8613 | **0.1532** | ? | CORE +0.016 real. Keep. |
+| **v151 E8** | **aspect=64→112 + lr=0.025** | **0.8215** | **0.1814** | 12.1m | **BIG WIN.** val_bpb −0.039, CORE +0.044. Matches v106 prior (1500-iter d12). |
+| v152 E9 | stack lr=0.025 + warmup=20 | 0.8599 | 0.1532 | ? | not additive with E4. Skip. |
+| v153 E10 | stack aspect=112 + lr=0.025 + warmup=20 | 0.8214 | 0.1737 | 12.1m | warmup HURTS on aspect stack. Reject. |
+| v154 E11 | d16 2000-iter baseline | 0.8318 | 0.1450 | ? | d16 anchor for transfer test |
+| v155 E12 | d16 + aspect=112 + lr=0.025 | running | | | does E8 transfer to deeper model? |
+
+**d12 2000-iter champion**: E8 (`--aspect-ratio=112 --matrix-lr=0.025`) — val_bpb 0.8215, CORE 0.1814, but 1.7x slower than baseline. At matched wall-clock, baseline w/ more iters may match.
+
+**Key findings so far**:
+1. Single-knob hyperparam wins at d12 2000-iter: matrix-lr=0.025 (+0.013 CORE), warmup=20 (+0.016). Both marginal.
+2. Architecture win: aspect=112 (+0.044 CORE) crushes hyperparam wins, but is 70% slower per iter.
+3. Stacking is not additive. warmup=20 alone good, warmup=20 + aspect=112 worse than aspect=112 alone.
+4. z-loss, softcap=30, unembed-lr=0.016, warmdown sweep: all null.
+
+### 2026-04-23 early hours — aspect=112 recipe at d12/d16/d22
+
+Aspect sweep at d12 2000-iter, matrix-lr=0.025:
+| aspect | val_bpb | CORE | verdict |
+|---|---|---|---|
+| 64 (base) | 0.8609 | 0.1373 | — |
+| 96 | 0.8323 | 0.1690 | improving |
+| 112 | **0.8215** | **0.1814** | CORE peak |
+| 128 | 0.8175 | 0.1737 | val_bpb better, CORE regress (decouple) |
+
+Stacking experiments at d12 aspect=112 + lr=0.025:
+| + knob | val_bpb | CORE | verdict |
+|---|---|---|---|
+| lr=0.020 (default) | 0.8220 | 0.1708 | lr=0.025 better |
+| lr=0.030 (v106 original) | 0.8218 | 0.1640 | too high at 2000-iter |
+| +warmup=20 (E10 triple) | 0.8214 | 0.1737 | warmup hurts stack |
+| +warmdown=0.75 | 0.8213 | 0.1764 | null |
+| window=LLLL | 0.8212 | 0.1718 | null |
+| +wd=0.20 (E19) | 0.8215 | **0.1875** | **+0.006 marginal win** |
+
+**Transfer tests**:
+| depth | config | val_bpb | CORE | Δ CORE vs baseline-depth |
+|---|---|---|---|---|
+| d12 | baseline | 0.8609 | 0.1373 | 0 |
+| d12 | aspect=112+lr=0.025+wd=0.20 | 0.8215 | **0.1875** | **+0.050** |
+| d16 | baseline | 0.8318 | 0.1450 | 0 |
+| d16 | aspect=112+lr=0.025+wd=0.20 | 0.8011 | **0.1861** | **+0.041** |
+| d22 | (v73, 6000-iter, default) | 0.724 | 0.2694 | anchor |
+| d22 | aspect=112+lr=0.025+wd=0.20 (2000-iter, dbs=8) | **0.7801** | **0.1965** | vs baseline TBD |
+
+**Key observation**: wd=0.20 benefit GROWS with depth (+0.006 at d12, +0.017 at d16 over aspect=112 alone). Suggests d22 benefit may be even larger. Need d22 baseline 2000-iter to confirm.
+
+v165 (d22 promotion) ran at 69% MFU, 37 min training. dbs=16 OOM'd at 80GB H100 (n_embd=2560 is at the memory edge).
+
+
+
