@@ -152,6 +152,18 @@ print0(f"Vocab size: {vocab_size:,}")
 # -----------------------------------------------------------------------------
 # Initialize the Model
 
+def _pick_n_kv_head(num_heads, divisor):
+    """Pick n_kv_head = largest k <= num_heads/divisor such that num_heads % k == 0.
+    Handles prime n_head (e.g. 11 at d22 head_dim=128): divisor=2 -> falls back to k=1 (MQA)."""
+    if divisor <= 1:
+        return num_heads
+    target = max(1, num_heads // divisor)
+    for k in range(target, 0, -1):
+        if num_heads % k == 0:
+            return k
+    return 1
+
+
 def build_model_meta(depth):
     """Build a model on meta device for a given depth (shapes/dtypes only, no data)."""
     # Model dim is nudged up to nearest multiple of head_dim for clean division
@@ -161,7 +173,7 @@ def build_model_meta(depth):
     num_heads = model_dim // args.head_dim
     config = GPTConfig(
         sequence_len=args.max_seq_len, vocab_size=vocab_size,
-        n_layer=depth, n_head=num_heads, n_kv_head=num_heads // max(args.n_kv_head_divisor, 1), n_embd=model_dim,
+        n_layer=depth, n_head=num_heads, n_kv_head=_pick_n_kv_head(num_heads, args.n_kv_head_divisor), n_embd=model_dim,
         window_pattern=args.window_pattern,
         num_experts=args.num_experts, top_k=args.top_k,
         num_shared_experts=args.num_shared_experts,
