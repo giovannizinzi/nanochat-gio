@@ -45,22 +45,35 @@ Baseline: val_bpb 0.8609, CORE 0.1373 (v142, bs=524K).
 3. **The val_bpb↔CORE decouple is universal.** aspect=128 beats aspect=112 on val_bpb but loses on CORE (benchmark tasks reward deep sequential reasoning, not just lower perplexity).
 4. **Compute scales monotonically.** More iters, bigger batch → always better val_bpb and usually CORE. The open question is per-wall-clock trade-offs.
 
+## The decisive v172 experiment (3000-iter)
+
+Ran the key follow-up while the overnight loop still had time. Result:
+
+| metric | v172 (3000-iter) | v73 (6000-iter) | delta |
+|---|---|---|---|
+| val_bpb | **0.7237** | 0.724 | **matched** (−0.0003) |
+| CORE | 0.2533 | **0.2694** | −0.016 (LOSS) |
+| wall-clock | 106.7 min | **88 min** | +19 min (LOSS) |
+
+**v172 matches v73's val_bpb at half the iters, but the val_bpb↔CORE decouple means it's ~0.016 below on CORE AND 19 min slower.** Extrapolating: v172 needs ~3600 iters (~128 min) to reach v73's CORE. Clear wall-clock loss.
+
 ## Honest assessment
 
-**Surprise finding from v171**: the aspect=112+wd=0.20+bs=1M recipe at d22 is MORE SAMPLE-EFFICIENT per iter than v73 default — reaches val_bpb 0.7453 at 2000 iters vs v73's 0.724 at 6000 iters. Per-iter cost is 2.4x higher (2.13s/iter vs 0.88s/iter), but the sample efficiency gap looks like it could compensate.
+**v73 stands.** After 25+ overnight experiments across d12/d16/d22, nothing from the hyperparam + architecture space beats v73's 88-min/0.2694 recipe at matched wall-clock.
 
-**The open question**: does v171 trajectory extrapolation at ~3000 iters / ~107 min beat v73's CORE 0.2694 at 88 min? This is the first overnight recipe that could plausibly win — but I couldn't test the 107-min run in remaining overnight time.
-
-Other conclusions:
+Key conclusions:
 - v73's single-knob hyperparam space is tightly tuned (20+ null sweeps confirmed).
-- Width (aspect ratio) helps smaller models (d12 +0.044 CORE, d16 +0.024), but at d22 the BATCH SIZE confound was bigger than the aspect effect.
-- The val_bpb↔CORE decouple is universal. aspect=128 beats aspect=112 on val_bpb but loses on CORE.
+- Width (aspect ratio) helps smaller models (d12 +0.044 CORE, d16 +0.024), but at d22 the benefit collapses against the 2.4x per-iter cost.
+- The val_bpb↔CORE decouple is universal. Wider models reach lower val_bpb faster but don't cash that efficiency into CORE — meaning per-wall-clock CORE is flat or worse.
+- bs=1M (v73 default) was the biggest overlooked confound in my d12 sweep (which used bs=524K).
+- Sample-efficient ≠ compute-efficient. At d22, reaching v73's val_bpb at half the iters doesn't translate to a CORE win.
 
-## The experiment worth running next
+## What's still untested
 
-**d22 + aspect=112 + lr=0.025 + wd=0.20 + bs=1M + 3000-iter** (~107 min)
-
-If CORE exceeds 0.2694 at this budget, we have beaten v73 at matched wall-clock with a new recipe. If not, v73 stands.
+- **Data-level interventions** (WRAP rephrased pretraining, MATES reweighting, perplexity filtering) — out of overnight scope; requires vLLM data gen pipelines.
+- **Chunked cross-entropy** (TODO in gpt.py:661) — could enable total_batch > 1M without logit OOM; marginal at best.
+- **GQA n_kv_head=n_head/2** — could cut per-iter cost ~10-15%; untested; genuine unknown.
+- **More compute** (v117 10k-iter → 0.2793 in 147 min) reliably works but violates wall-clock constraint.
 
 ## Git state
 
