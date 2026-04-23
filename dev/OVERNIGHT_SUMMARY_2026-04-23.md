@@ -85,7 +85,7 @@ Added 3 new flags: `--n-kv-head-divisor`, `--no-rope`, `--chunked-ce-chunk-size`
 | v177 | d22 + chunked-CE only | 0.7736 | 0.1942 | 29.9 min | **bit-identical to v170 baseline** (confirms correctness) |
 | **v178** | d22 + head_dim=64 + GQA 2:1 bs=1M 2000it | 0.7789 | **0.2026** | 28.6 min | **+0.010 CORE iso-wallclock** |
 | v179 | v178 recipe at 6000-iter | 0.7291 | 0.2551 | 86.1 min | LOSS vs v73 (−0.014 CORE at −2min wallclock) |
-| v180 | v178 + bs=2M + 3000-iter (iso-tokens) | *running* | *running* | ~85 min | final overnight test |
+| v180 | v178 + bs=2M + 3000-iter (iso-tokens) | 0.7339 | 0.2375 | 85.1 min | LOSS: −0.018 vs v179 iso-tokens, −0.032 vs v73 |
 
 **Learnings from Round 2**:
 - chunked-CE works as designed (bit-identical to one-shot) but provides no speedup at d22 (logits are not the wall-clock bottleneck at this scale).
@@ -95,6 +95,14 @@ Added 3 new flags: `--n-kv-head-divisor`, `--no-rope`, `--chunked-ce-chunk-size`
 - d12 46% speedup from combined flags was a small-model artifact. At d22, compute is matmul-bound, so RoPE/CE/KV projection overhead is negligible.
 
 **Final overnight position**: v73 remains wall-clock champion. The aspect=112 direction, the GQA+head-dim-64 direction, and the NoPE/chunked-CE direction all fail to beat v73 at 88 min / CORE 0.2694. The recipe is tightly tuned.
+
+**Additional finding from v180**: at iso-tokens + iso-wallclock, **bs=1M with more iters beats bs=2M with fewer iters** (−0.018 CORE for bs=2M). More optimization steps > bigger batch updates at this budget. Consistent with Chinchilla-style scaling.
+
+**What a morning-session should try** (per Ilya/Alec framing):
+1. **MLA (Multi-head Latent Attention)** — the one remaining "free lunch" untested. Low-rank KV compression. ~150 LOC but theoretically could reduce per-iter compute WITHOUT the MQA quality loss.
+2. **Data-level**: WRAP rephrased pretraining. Would require building the offline vLLM rephrasing pipeline first (~1-2 hrs setup, then ~45 min data gen per 20% of ClimbMix).
+3. **Recipe search with more iters**: if user accepts 100-130 min budget, v178's head_dim=64+GQA might beat v73 at matched compute-optimal (8-10 tokens/param).
+4. None of the above are guaranteed wins. v73's tightness is real.
 
 ## Git state
 
