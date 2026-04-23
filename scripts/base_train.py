@@ -77,6 +77,7 @@ parser.add_argument("--doc-mask", action="store_true", help="mask attention acro
 parser.add_argument("--n-kv-head-divisor", type=int, default=1, help="n_kv_head = n_head // N. 1 = MHA (default), 2 = GQA halves KV. Must divide n_head evenly.")
 parser.add_argument("--no-rope", action="store_true", help="Disable RoPE (NoPE, Haviv et al. 2022). Causal mask implicitly encodes position. Saves a few ms/step.")
 parser.add_argument("--chunked-ce-chunk-size", type=int, default=0, help="Chunk cross-entropy over seq dim to save logits memory. 0 = disabled (one-shot CE). Typical: 128 or 256.")
+parser.add_argument("--mla-lora-rank", type=int, default=0, help="MLA (DeepSeek-V2 latent attention). K/V decoded from shared low-rank latent of width r. 0 = disabled. Typical: 256 or 384.")
 # Training horizon (only one used, in order of precedence)
 parser.add_argument("--num-iterations", type=int, default=-1, help="explicit number of optimization steps (-1 = disable)")
 parser.add_argument("--target-flops", type=float, default=-1.0, help="calculate num_iterations to reach target_flops (-1 = disable)")
@@ -193,6 +194,7 @@ def build_model_meta(depth):
         z_loss_coef=args.z_loss_coef,
         use_rope=not args.no_rope,
         chunked_ce_chunk_size=args.chunked_ce_chunk_size,
+        mla_lora_rank=args.mla_lora_rank,
     )
     with torch.device("meta"):
         model_meta = GPT(config)

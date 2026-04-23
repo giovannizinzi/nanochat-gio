@@ -82,6 +82,11 @@ class GPTConfig:
     # avoid materializing a (B, T, V) fp32 logits tensor at once. 0 = disabled (one-shot CE).
     # Typical values: 128 or 256. Loss is bit-identical to the one-shot path.
     chunked_ce_chunk_size: int = 0
+    # MLA (DeepSeek-V2 Multi-head Latent Attention, arxiv 2405.04434). When > 0, K and V
+    # are computed from a shared low-rank latent: x -> c_kv_a -> (B,T,r) -> {c_k_b, c_v_b}
+    # -> (B, T, n_kv_head, head_dim). Simplified variant without the decoupled RoPE head;
+    # RoPE applies to full Q and K as usual. 0 = disabled (standard MHA/GQA via c_k/c_v).
+    mla_lora_rank: int = 0
 
 
 def norm(x):
@@ -118,8 +123,17 @@ class CausalSelfAttention(nn.Module):
         assert self.n_embd % self.n_head == 0
         assert self.n_kv_head <= self.n_head and self.n_head % self.n_kv_head == 0
         self.c_q = Linear(self.n_embd, self.n_head * self.head_dim, bias=False)
-        self.c_k = Linear(self.n_embd, self.n_kv_head * self.head_dim, bias=False)
-        self.c_v = Linear(self.n_embd, self.n_kv_head * self.head_dim, bias=False)
+        # MLA: K and V decoded from a shared low-rank latent of width mla_lora_rank.
+        # Otherwise: standard MHA/GQA with direct c_k, c_v projections.
+        self.use_mla = getattr(config, "mla_lora_rank", 0) > 0
+        if self.use_mla:
+            self.mla_rank = config.mla_lora_rank
+            self.c_kv_a = Linear(self.n_embd, self.mla_rank, bias=False)
+            self.c_k_b = Linear(self.mla_rank, self.n_kv_head * self.head_dim, bias=False)
+            self.c_v_b = Linear(self.mla_rank, self.n_kv_head * self.head_dim, bias=False)
+        else:
+            self.c_k = Linear(self.n_embd, self.n_kv_head * self.head_dim, bias=False)
+            self.c_v = Linear(self.n_embd, self.n_kv_head * self.head_dim, bias=False)
         self.c_proj = Linear(self.n_embd, self.n_embd, bias=False)
         self.ve_gate_channels = 12
         self.ve_gate = Linear(self.ve_gate_channels, self.n_kv_head, bias=False) if has_ve(layer_idx, config.n_layer) else None
@@ -130,8 +144,14 @@ class CausalSelfAttention(nn.Module):
         # Project the input to get queries, keys, and values
         # Shape: (B, T, H, D) - FA3's native layout, no transpose needed!
         q = self.c_q(x).view(B, T, self.n_head, self.head_dim)
-        k = self.c_k(x).view(B, T, self.n_kv_head, self.head_dim)
-        v = self.c_v(x).view(B, T, self.n_kv_head, self.head_dim)
+        if self.use_mla:
+            # DeepSeek-V2 style: shared low-rank latent, then per-KV decompression.
+            latent = self.c_kv_a(x)  # (B, T, r)
+            k = self.c_k_b(latent).view(B, T, self.n_kv_head, self.head_dim)
+            v = self.c_v_b(latent).view(B, T, self.n_kv_head, self.head_dim)
+        else:
+            k = self.c_k(x).view(B, T, self.n_kv_head, self.head_dim)
+            v = self.c_v(x).view(B, T, self.n_kv_head, self.head_dim)
 
         # Value residual (ResFormer): mix in value embedding with input-dependent gate per head
         if ve is not None:
@@ -308,8 +328,14 @@ class GPT(nn.Module):
         s = 3**0.5 * n_embd**-0.5 # sqrt(3) multiplier makes sure Uniform achieves the same std as Normal
         for block in self.transformer.h:
             torch.nn.init.uniform_(block.attn.c_q.weight, -s, s) # weights use Uniform to avoid outliers
-            torch.nn.init.uniform_(block.attn.c_k.weight, -s, s)
-            torch.nn.init.uniform_(block.attn.c_v.weight, -s, s)
+            if block.attn.use_mla:
+                # MLA: latent projection + per-K/V decompression. Init all with the standard scale.
+                torch.nn.init.uniform_(block.attn.c_kv_a.weight, -s, s)
+                torch.nn.init.uniform_(block.attn.c_k_b.weight, -s, s)
+                torch.nn.init.uniform_(block.attn.c_v_b.weight, -s, s)
+            else:
+                torch.nn.init.uniform_(block.attn.c_k.weight, -s, s)
+                torch.nn.init.uniform_(block.attn.c_v.weight, -s, s)
             torch.nn.init.zeros_(block.attn.c_proj.weight) # projections are zero
             if block.use_moe:
                 block.mlp.init_weights()  # MoE does its own init (zero c_proj => zero contribution at init)
