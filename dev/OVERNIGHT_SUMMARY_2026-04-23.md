@@ -71,9 +71,30 @@ Key conclusions:
 ## What's still untested
 
 - **Data-level interventions** (WRAP rephrased pretraining, MATES reweighting, perplexity filtering) — out of overnight scope; requires vLLM data gen pipelines.
-- **Chunked cross-entropy** (TODO in gpt.py:661) — could enable total_batch > 1M without logit OOM; marginal at best.
-- **GQA n_kv_head=n_head/2** — could cut per-iter cost ~10-15%; untested; genuine unknown.
 - **More compute** (v117 10k-iter → 0.2793 in 147 min) reliably works but violates wall-clock constraint.
+- **MLA (Multi-head Latent Attention, DeepSeek-V2)** — complex ~150 LOC implementation; theoretically most promising remaining angle.
+
+## Round 2 (user requested GQA/NoPE/chunked-CE/MLA)
+
+Added 3 new flags: `--n-kv-head-divisor`, `--no-rope`, `--chunked-ce-chunk-size`. d12 smoke test passed with combined 46% per-iter speedup. **But the d12 speedup did NOT transfer to d22**.
+
+| exp | config | val_bpb | CORE | runtime | verdict |
+|---|---|---|---|---|---|
+| v174/175 | d22 + MQA + NoPE + chunked-CE bs=1M | 0.7957 | 0.1773 | 26.0 min | quality LOSS −0.016 CORE |
+| v176 | d22 + NoPE + chunked-CE (no MQA) | 0.7838 | 0.1784 | 29.3 min | no speedup, quality LOSS |
+| v177 | d22 + chunked-CE only | 0.7736 | 0.1942 | 29.9 min | **bit-identical to v170 baseline** (confirms correctness) |
+| **v178** | d22 + head_dim=64 + GQA 2:1 bs=1M 2000it | 0.7789 | **0.2026** | 28.6 min | **+0.010 CORE iso-wallclock** |
+| v179 | v178 recipe at 6000-iter | 0.7291 | 0.2551 | 86.1 min | LOSS vs v73 (−0.014 CORE at −2min wallclock) |
+| v180 | v178 + bs=2M + 3000-iter (iso-tokens) | *running* | *running* | ~85 min | final overnight test |
+
+**Learnings from Round 2**:
+- chunked-CE works as designed (bit-identical to one-shot) but provides no speedup at d22 (logits are not the wall-clock bottleneck at this scale).
+- NoPE (Haviv et al. 2022) **hurts** CORE at d22 by ~0.015. Causal mask alone is insufficient position signal.
+- MQA (1 KV head at d22/11 heads because 11 is prime) **hurts** CORE by ~0.016. Attention expressivity matters.
+- head_dim=64 + GQA 2:1 (22 heads, 11 KV heads): **helps at 2000-iter** (+0.010 CORE iso-wallclock), but **the gain does not sustain at 6000-iter**. At full budget the recipe saturates 0.014 below v73.
+- d12 46% speedup from combined flags was a small-model artifact. At d22, compute is matmul-bound, so RoPE/CE/KV projection overhead is negligible.
+
+**Final overnight position**: v73 remains wall-clock champion. The aspect=112 direction, the GQA+head-dim-64 direction, and the NoPE/chunked-CE direction all fail to beat v73 at 88 min / CORE 0.2694. The recipe is tightly tuned.
 
 ## Git state
 
