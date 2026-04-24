@@ -87,6 +87,11 @@ class GPTConfig:
     # -> (B, T, n_kv_head, head_dim). Simplified variant without the decoupled RoPE head;
     # RoPE applies to full Q and K as usual. 0 = disabled (standard MHA/GQA via c_k/c_v).
     mla_lora_rank: int = 0
+    # Attention-output gate (Qwen3.6-style `attn_output_gate`). When True, apply a
+    # SiLU-gated projection to the attention output before c_proj:
+    #   y = silu(c_attn_gate(x)) * attn_out, then c_proj(y).
+    # Extra params: n_embd² per block. Small compute overhead, known to stabilize attention.
+    attn_output_gate: bool = False
 
 
 def norm(x):
@@ -137,6 +142,10 @@ class CausalSelfAttention(nn.Module):
         self.c_proj = Linear(self.n_embd, self.n_embd, bias=False)
         self.ve_gate_channels = 12
         self.ve_gate = Linear(self.ve_gate_channels, self.n_kv_head, bias=False) if has_ve(layer_idx, config.n_layer) else None
+        # Qwen3.6-style attention-output gate: SiLU gate applied to attn output before c_proj.
+        self.use_attn_output_gate = getattr(config, "attn_output_gate", False)
+        if self.use_attn_output_gate:
+            self.c_attn_gate = Linear(self.n_embd, self.n_head * self.head_dim, bias=False)
 
     def forward(self, x, ve, cos_sin, window_size, kv_cache, doc_mask=None):
         B, T, C = x.size()
@@ -190,6 +199,9 @@ class CausalSelfAttention(nn.Module):
 
         # Re-assemble the heads and project back to residual stream
         y = y.contiguous().view(B, T, -1)
+        if self.use_attn_output_gate:
+            # Qwen3.6 attn_output_gate: SiLU-gated attention output before c_proj.
+            y = F.silu(self.c_attn_gate(x)) * y
         y = self.c_proj(y)
         return y
 
@@ -336,6 +348,9 @@ class GPT(nn.Module):
             else:
                 torch.nn.init.uniform_(block.attn.c_k.weight, -s, s)
                 torch.nn.init.uniform_(block.attn.c_v.weight, -s, s)
+            if block.attn.use_attn_output_gate:
+                # Zero-init: silu(0)=0 → gate starts neutral; gradient fills it in.
+                torch.nn.init.zeros_(block.attn.c_attn_gate.weight)
             torch.nn.init.zeros_(block.attn.c_proj.weight) # projections are zero
             if block.use_moe:
                 block.mlp.init_weights()  # MoE does its own init (zero c_proj => zero contribution at init)
