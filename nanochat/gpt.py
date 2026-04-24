@@ -349,8 +349,9 @@ class GPT(nn.Module):
                 torch.nn.init.uniform_(block.attn.c_k.weight, -s, s)
                 torch.nn.init.uniform_(block.attn.c_v.weight, -s, s)
             if block.attn.use_attn_output_gate:
-                # Zero-init: silu(0)=0 → gate starts neutral; gradient fills it in.
-                torch.nn.init.zeros_(block.attn.c_attn_gate.weight)
+                # Uniform init (same scale as c_q/c_k/c_v). v185 bug: zero-init caused
+                # silu(0)=0 which zeroed attention output and blocked gradient to Q/K/V.
+                torch.nn.init.uniform_(block.attn.c_attn_gate.weight, -s, s)
             torch.nn.init.zeros_(block.attn.c_proj.weight) # projections are zero
             if block.use_moe:
                 block.mlp.init_weights()  # MoE does its own init (zero c_proj => zero contribution at init)
