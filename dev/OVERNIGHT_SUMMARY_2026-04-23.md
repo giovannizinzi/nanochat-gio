@@ -160,3 +160,18 @@ After 30+ negative experiments at d22 6000-iter (90min each), pivoted to d22 150
 
 **To submit to leaderboard**: run v198's recipe with `--core-metric-every=999999` (no trajectory eval overhead) for clean 88-min wall-clock + CORE 0.273x + val_bpb 0.724x.
 
+
+## Final tau sweep (confirms v198 = tau=100 optimum)
+
+After v198 won, ran 1500-iter quick filter on tau values to confirm tau=100 isn't off-peak:
+| muonclip tau | val_bpb @1500 | CORE @1500 |
+|---|---|---|
+| 50 | 0.7909 | 0.1953 |
+| **100** | 0.7908 | **0.2005** ← peak |
+| 200 | 0.7909 | 0.1917 |
+
+Sharp peak at tau=100. tau=50 (more aggressive clip) and tau=200 (lighter clip) both regress.
+
+**Definitive winner**: `python -m scripts.base_train --depth=22 --target-param-data-ratio=8.25 --device-batch-size=16 --total-batch-size=1048576 --fp8 --warmup-ratio=0.01 --adam-beta1=0.9 --adam-beta2=0.95 --num-iterations=6000 --muon-qk-clip-tau=100`
+
+Result: val_bpb 0.7242, CORE 0.2731, crosses GPT-2 CORE 0.256525 at ~80 min pure-train wall-clock.
