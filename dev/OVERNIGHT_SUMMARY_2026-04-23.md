@@ -125,3 +125,38 @@ Untested directions I'd personally prioritize:
 2. **Chunked cross-entropy** (TODO in gpt.py:661). Enables larger batch without logit OOM.
 3. **GQA n_kv_head=n_head/2**. Simpler model, faster per iter. Low-risk code change.
 4. **WRAP rephrased pretraining** — needs separate vLLM data gen pipeline first.
+
+## Round 3 (2026-04-24/25): MuonClip wins via small-scale filter strategy
+
+After 30+ negative experiments at d22 6000-iter (90min each), pivoted to d22 1500-iter quick-filter (27min each). Filtered 6 hypotheses cheaply, promoted only the best (muonclip) to full 6000-iter.
+
+**1500-iter filter (vs Q0 baseline val_bpb 0.7910 / CORE 0.1937)**:
+| Q | knob | val_bpb | CORE | verdict |
+|---|---|---|---|---|
+| Q1 | matrix-lr=0.025 | 0.7885 | 0.1967 | small both |
+| Q2 | matrix-lr=0.022 | 0.7890 | 0.1972 | small both |
+| **Q3** | **muonclip tau=100** | 0.7908 | **0.2005** | **CORE +0.007 — promote** |
+| Q4 | attn-output-gate | 0.7898 | 0.1934 | val small |
+| Q5 | embed-lr=0.4 | 0.7895 | 0.1932 | tied |
+| Q6 | muonclip + lr=0.025 | 0.7883 | 0.1994 | val best, CORE same as Q3 |
+
+**6000-iter scale-up** (anchor v73: val_bpb 0.7242 / CORE 0.2714 / ~81 min crossover):
+| run | recipe | val_bpb | CORE | crosses 0.2565 at |
+|---|---|---|---|---|
+| **v198 (E48)** | **muonclip tau=100 alone** | **0.7242** | **0.2731** | **~80 min** ← **WINNER** |
+| v199 (E49) | muonclip + warmdown=0.85 | 0.7240 | 0.2696 | ~81 min |
+| v200 (E50) | muonclip + lr=0.025 | 0.7245 | 0.2667 | ~83 min |
+| v201 (E51) | muonclip + warmup=20 | 0.7245 | 0.2625 | ~82 min |
+
+**v198 IS THE ROUND-3 WINNER**: val_bpb tied with v73, CORE +0.0017, crosses GPT-2 CORE ~1 min faster (80 vs 81 min pure-train).
+
+**Key learnings**:
+1. **Small-scale filter strategy works**: 6× faster iteration (27min vs 90min) revealed muonclip as the CORE-mover. Should have started here.
+2. **MuonClip (Kimi K2 §A QK-Clip) is a real CORE win at d22** — never tested cleanly before round 3. Previous v94 only tested as stack with matrix-lr=0.03 (which cancelled the gain).
+3. **All stacks on muonclip REGRESSED** (warmdown=0.85, lr=0.025, warmup=20). Muonclip alone is at a local optimum.
+4. **val_bpb↔CORE decouple persists**: v200 tied v73's val_bpb but lost CORE.
+
+**To try next**: muonclip + warmdown=0.75, muonclip + bs=2M, MLA r=384 + muonclip, perplexity-filtered shards (data-level).
+
+**To submit to leaderboard**: run v198's recipe with `--core-metric-every=999999` (no trajectory eval overhead) for clean 88-min wall-clock + CORE 0.273x + val_bpb 0.724x.
+
