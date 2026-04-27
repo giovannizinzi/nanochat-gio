@@ -238,17 +238,13 @@ class GPT(nn.Module):
         for i in range(n_layer):
             self.x0_lambdas.data[i] = 0.20 - (0.15 * i / max(n_layer - 1, 1))
 
-        # Smear/backout scalars and smear gate must be explicitly initialized.
-        # Zero-init AND freeze both lambdas to disable the autoresearch-round-2 paths
-        # entirely — earlier d22 experiments (v198) on a pre-round-2 codebase achieved
-        # CORE 0.2731 vs v211 reproducing the same recipe with smear/backout active
-        # at only 0.2569. Hypothesis: at d22 these paths net-regress.
+        # Smear/backout scalars and smear gate.
+        # Zero-init both lambdas (was 0.2 for backout) — d22 ablation experiment.
+        # NOTE: we keep requires_grad=True so AdamW handles the smear_params group
+        # cleanly; the params will only grow if loss landscape rewards it.
         torch.nn.init.zeros_(self.smear_lambda)
-        torch.nn.init.zeros_(self.backout_lambda)  # was 0.2 — disabling backout
-        torch.nn.init.uniform_(self.smear_gate.weight, 0.0, 0.02)
-        self.smear_lambda.requires_grad_(False)
-        self.backout_lambda.requires_grad_(False)
-        self.smear_gate.weight.requires_grad_(False)
+        torch.nn.init.zeros_(self.backout_lambda)  # was 0.2 — testing d22 without backout init
+        torch.nn.init.zeros_(self.smear_gate.weight)  # was uniform(0, 0.02) — start fully neutralized
 
         # Value embeddings (init like c_v: uniform with same std)
         for ve in self.value_embeds.values():
