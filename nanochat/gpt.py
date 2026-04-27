@@ -37,6 +37,11 @@ class GPTConfig:
     # Characters: L=long (full context), S=short (quarter context)
     # Examples: "L"=all full context, "SL"=alternating, "SSL"=two short then one long
     window_pattern: str = "SSSL"
+    # PaLM-style logit z-loss (Chowdhery et al. arxiv 2204.02311 §5):
+    #   aux = z_loss_coef * mean((logsumexp(logits))**2)
+    # Keeps log-partition Z near 0; tightens softmax. 0.0 = disabled (bit-identical to
+    # current behavior). Typical: 1e-4.
+    z_loss_coef: float = 0.0
 
 
 def norm(x):
@@ -495,6 +500,17 @@ class GPT(nn.Module):
             # training: given the targets, compute and return the loss
             # TODO experiment with chunked cross-entropy?
             loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1, reduction=loss_reduction)
+            # PaLM z-loss: penalize logsumexp(logits)^2 to keep log-partition near 0.
+            # No-op when z_loss_coef=0 (default).
+            if self.config.z_loss_coef > 0.0:
+                log_Z = torch.logsumexp(logits, dim=-1)  # (B, T)
+                if loss_reduction == 'mean':
+                    z_loss = (log_Z ** 2).mean()
+                elif loss_reduction == 'sum':
+                    z_loss = (log_Z ** 2).sum()
+                else:  # 'none'
+                    z_loss = (log_Z ** 2).view(-1)
+                loss = loss + self.config.z_loss_coef * z_loss
             return loss
         else:
             # inference: just return the logits directly

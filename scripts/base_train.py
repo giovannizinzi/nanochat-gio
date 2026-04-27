@@ -64,6 +64,7 @@ parser.add_argument("--unembedding-lr", type=float, default=0.008, help="learnin
 parser.add_argument("--weight-decay", type=float, default=0.28, help="cautious weight decay for the Muon optimizer (for weights)")
 parser.add_argument("--matrix-lr", type=float, default=0.02, help="learning rate for matrix parameters (Muon)")
 parser.add_argument("--muon-qk-clip-tau", type=float, default=0.0, help="MuonClip QK-Clip cap on max attention logit (Kimi K2, arxiv 2507.20534 §A). 0 = disabled. Typical: 100.")
+parser.add_argument("--z-loss-coef", type=float, default=0.0, help="PaLM-style logit z-loss coefficient (arxiv 2204.02311 §5). Penalizes logsumexp(logits)^2 to keep log-partition near 0. 0 = disabled. Typical: 1e-4.")
 parser.add_argument("--scalar-lr", type=float, default=0.5, help="learning rate for scalars (resid_lambdas, x0_lambdas)")
 parser.add_argument("--warmup-steps", type=int, default=40, help="number of steps for LR warmup")
 parser.add_argument("--warmdown-ratio", type=float, default=0.65, help="ratio of iterations for LR warmdown")
@@ -138,6 +139,7 @@ def build_model_meta(depth):
         sequence_len=args.max_seq_len, vocab_size=vocab_size,
         n_layer=depth, n_head=num_heads, n_kv_head=num_heads, n_embd=model_dim,
         window_pattern=args.window_pattern,
+        z_loss_coef=args.z_loss_coef,
     )
     with torch.device("meta"):
         model_meta = GPT(config)
