@@ -403,15 +403,15 @@ class GPT(nn.Module):
         # Build param_groups with all required fields explicit
         param_groups = [
             # AdamW groups (embeddings, lm_head, scalars)
-            # Uniform AdamW (0.9, 0.95) across all groups — Run 1 default.
-            # Hypothesis: Run 5/6 per-group betas were autoresearch-tuned at d12→d24,
-            # may not be optimal at d22. This reverts to the standard LLM-training value.
+            # lm_head: betas (0.8, 0.96) → (0.9, 0.95). Single-group test of the
+            # standard LLM-training betas on the largest matmul, leaving other groups
+            # at their autoresearch-round-2 tuned values.
             dict(kind='adamw', params=lm_head_params, lr=unembedding_lr * dmodel_lr_scale, betas=(0.9, 0.95), eps=1e-10, weight_decay=0.01),
-            dict(kind='adamw', params=embedding_params, lr=embedding_lr * dmodel_lr_scale, betas=(0.9, 0.95), eps=1e-10, weight_decay=0.001),
-            dict(kind='adamw', params=value_embeds_params, lr=embedding_lr * dmodel_lr_scale * 0.5, betas=(0.9, 0.95), eps=1e-10, weight_decay=0.01),
-            dict(kind='adamw', params=resid_params, lr=scalar_lr * 0.01, betas=(0.9, 0.95), eps=1e-10, weight_decay=0.05),
-            dict(kind='adamw', params=x0_params, lr=scalar_lr, betas=(0.9, 0.95), eps=1e-10, weight_decay=0.0),
-            dict(kind='adamw', params=smear_params, lr=0.2, betas=(0.9, 0.95), eps=1e-10, weight_decay=0.0),
+            dict(kind='adamw', params=embedding_params, lr=embedding_lr * dmodel_lr_scale, betas=(0.8, 0.995), eps=1e-10, weight_decay=0.001),
+            dict(kind='adamw', params=value_embeds_params, lr=embedding_lr * dmodel_lr_scale * 0.5, betas=(0.8, 0.995), eps=1e-10, weight_decay=0.01),
+            dict(kind='adamw', params=resid_params, lr=scalar_lr * 0.01, betas=(0.8, 0.95), eps=1e-10, weight_decay=0.05),
+            dict(kind='adamw', params=x0_params, lr=scalar_lr, betas=(0.96, 0.95), eps=1e-10, weight_decay=0.0),  # higher beta1 for x0
+            dict(kind='adamw', params=smear_params, lr=0.2, betas=(0.8, 0.95), eps=1e-10, weight_decay=0.0),
         ]
         # Muon groups (matrix params, grouped by shape for stacking)
         for shape in sorted({p.shape for p in matrix_params}):
