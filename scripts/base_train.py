@@ -76,6 +76,7 @@ parser.add_argument("--core-metric-every", type=int, default=2000, help="evaluat
 parser.add_argument("--core-metric-max-per-task", type=int, default=500, help="examples per task for CORE metric")
 parser.add_argument("--sample-every", type=int, default=2000, help="sample from model every N steps (-1 = disable)")
 parser.add_argument("--save-every", type=int, default=-1, help="save checkpoints every N steps (-1 = only at end)")
+parser.add_argument("--mtp-coef", type=float, default=0.0, help="DeepSeek-V3 Multi-Token Prediction loss weight (0=disabled, typical: 0.3). Adds one extra Transformer block predicting depth+2 token; shares lm_head.")
 # Output
 parser.add_argument("--model-tag", type=str, default=None, help="override model tag for checkpoint directory name")
 args = parser.parse_args()
@@ -138,6 +139,7 @@ def build_model_meta(depth):
         sequence_len=args.max_seq_len, vocab_size=vocab_size,
         n_layer=depth, n_head=num_heads, n_kv_head=num_heads, n_embd=model_dim,
         window_pattern=args.window_pattern,
+        use_mtp=args.mtp_coef > 0.0,
     )
     with torch.device("meta"):
         model_meta = GPT(config)
@@ -510,7 +512,7 @@ while True:
     synchronize()
     t0 = time.time()
     for micro_step in range(grad_accum_steps):
-        loss = model(x, y)
+        loss = model(x, y, mtp_coef=args.mtp_coef)
         train_loss = loss.detach() # for logging
         loss = loss / grad_accum_steps # each .backward() is a grad sum => normalize loss here
         if scaler is not None:

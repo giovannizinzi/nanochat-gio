@@ -37,6 +37,9 @@ class GPTConfig:
     # Characters: L=long (full context), S=short (quarter context)
     # Examples: "L"=all full context, "SL"=alternating, "SSL"=two short then one long
     window_pattern: str = "SSSL"
+    # Multi-Token Prediction (DeepSeek-V3 §2.4): one extra Transformer block predicts
+    # tokens at depth +2 from the trunk's hidden state, sharing lm_head.
+    use_mtp: bool = False
 
 
 def norm(x):
@@ -173,6 +176,10 @@ class GPT(nn.Module):
             "h": nn.ModuleList([Block(config, layer_idx) for layer_idx in range(config.n_layer)]),
         })
         self.lm_head = Linear(config.n_embd, padded_vocab_size, bias=False)
+        # MTP head: single extra Transformer block predicting tokens at depth +2.
+        # Shares lm_head + final RMSNorm with main path. layer_idx=n_layer (no value-embed gate).
+        if getattr(config, 'use_mtp', False):
+            self.mtp_block = Block(config, layer_idx=config.n_layer)
         # Per-layer learnable scalars (inspired by modded-nanogpt)
         # resid_lambdas: scales the residual stream at each layer (init 1.0 = neutral)
         # x0_lambdas: blends initial embedding back in at each layer (init 0.0 = disabled)
@@ -246,6 +253,16 @@ class GPT(nn.Module):
         # Value embeddings (init like c_v: uniform with same std)
         for ve in self.value_embeds.values():
             torch.nn.init.uniform_(ve.weight, -s, s)
+
+        # MTP block: same init scheme as the trunk blocks
+        if getattr(self.config, 'use_mtp', False):
+            block = self.mtp_block
+            torch.nn.init.uniform_(block.attn.c_q.weight, -s, s)
+            torch.nn.init.uniform_(block.attn.c_k.weight, -s, s)
+            torch.nn.init.uniform_(block.attn.c_v.weight, -s, s)
+            torch.nn.init.zeros_(block.attn.c_proj.weight)
+            torch.nn.init.uniform_(block.mlp.c_fc.weight, -s * 0.4, s * 0.4)
+            torch.nn.init.zeros_(block.mlp.c_proj.weight)
 
         # Gate weights init with small positive values so gates start slightly above neutral
         for block in self.transformer.h:
@@ -433,7 +450,7 @@ class GPT(nn.Module):
             group["initial_lr"] = group["lr"]
         return optimizer
 
-    def forward(self, idx, targets=None, kv_cache=None, loss_reduction='mean'):
+    def forward(self, idx, targets=None, kv_cache=None, loss_reduction='mean', mtp_coef=0.0):
         B, T = idx.size()
 
         # Grab the rotary embeddings for the current sequence length (they are of shape (1, seq_len, 1, head_dim/2))
@@ -482,6 +499,7 @@ class GPT(nn.Module):
         # Subtract mid-layer residual to remove low-level features before logit projection
         if x_backout is not None:
             x = x - self.backout_lambda.to(x.dtype) * x_backout
+        x_pre_norm = x  # save for MTP head (branches before the final norm)
         x = norm(x)
 
         # Forward the lm_head (compute logits)
@@ -495,6 +513,23 @@ class GPT(nn.Module):
             # training: given the targets, compute and return the loss
             # TODO experiment with chunked cross-entropy?
             loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1, reduction=loss_reduction)
+            # Multi-Token Prediction (DeepSeek-V3 §2.4): aux head predicts tokens at depth +2.
+            # Reuses lm_head + final RMSNorm; one extra Transformer block on the trunk's
+            # pre-norm hidden state.
+            if mtp_coef > 0.0 and getattr(self.config, 'use_mtp', False):
+                full_window = (-1, 0)
+                x_mtp = self.mtp_block(x_pre_norm, None, cos_sin, full_window, None)
+                x_mtp = norm(x_mtp)
+                logits_mtp = self.lm_head(x_mtp)[..., :self.config.vocab_size]
+                logits_mtp = logits_mtp.float()
+                logits_mtp = softcap * torch.tanh(logits_mtp / softcap)
+                # mtp_targets[t] = idx[t+2] = targets[t+1]; last position has no valid +2 target
+                mtp_targets = torch.roll(targets, shifts=-1, dims=1)
+                mtp_targets[:, -1] = -1
+                mtp_loss = F.cross_entropy(logits_mtp.view(-1, logits_mtp.size(-1)),
+                                           mtp_targets.view(-1), ignore_index=-1,
+                                           reduction=loss_reduction)
+                loss = loss + mtp_coef * mtp_loss
             return loss
         else:
             # inference: just return the logits directly
