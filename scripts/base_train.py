@@ -76,6 +76,7 @@ parser.add_argument("--core-metric-every", type=int, default=2000, help="evaluat
 parser.add_argument("--core-metric-max-per-task", type=int, default=500, help="examples per task for CORE metric")
 parser.add_argument("--sample-every", type=int, default=2000, help="sample from model every N steps (-1 = disable)")
 parser.add_argument("--save-every", type=int, default=-1, help="save checkpoints every N steps (-1 = only at end)")
+parser.add_argument("--swa-beta", type=float, default=0.0, help="SWA EMA decay during warmdown (0=disabled, typical: 0.999). Final checkpoint = EMA-averaged weights.")
 # Output
 parser.add_argument("--model-tag", type=str, default=None, help="override model tag for checkpoint directory name")
 args = parser.parse_args()
@@ -387,6 +388,13 @@ def get_muon_momentum(it):
 def get_weight_decay(it):
     return weight_decay_scaled * 0.5 * (1 + math.cos(math.pi * it / num_iterations))
 
+# SWA: warmdown-only EMA of master weights. Final checkpoint = EMA-averaged.
+swa_warmdown_start = num_iterations - round(args.warmdown_ratio * num_iterations)
+swa_enabled = args.swa_beta > 0.0
+swa_state = {}  # name -> tensor; lazily initialized at the first SWA step
+if swa_enabled:
+    print0(f"SWA enabled: β={args.swa_beta}, averaging from step {swa_warmdown_start} to {num_iterations}")
+
 # -----------------------------------------------------------------------------
 # Training loop
 
@@ -477,10 +485,18 @@ while True:
 
     # save checkpoint: at the end of the run, or every save_every steps, except at the first step or the resume step
     if last_step or (step > 0 and step != args.resume_from_step and args.save_every > 0 and step % args.save_every == 0):
+        # If SWA enabled and we're at the final step, replace param entries in state_dict with EMA-averaged versions.
+        # Buffers (rotary cache etc.) stay as-is. Optimizer state is unchanged.
+        save_state_dict = orig_model.state_dict()
+        if swa_enabled and last_step and swa_state:
+            print0(f"SWA: replacing {len(swa_state)} param tensors in checkpoint with EMA-averaged versions")
+            for name, swa_tensor in swa_state.items():
+                if name in save_state_dict:
+                    save_state_dict[name] = swa_tensor
         save_checkpoint(
             checkpoint_dir,
             step,
-            orig_model.state_dict(), # model parameters
+            save_state_dict, # model parameters (SWA-averaged at final step if enabled)
             optimizer.state_dict(), # optimizer state
             { # metadata saved as json
                 "step": step,
@@ -539,6 +555,14 @@ while True:
         scaler.update()
     else:
         optimizer.step()
+    # SWA update: EMA of master weights during warmdown phase only
+    if swa_enabled and step >= swa_warmdown_start:
+        with torch.no_grad():
+            for name, param in orig_model.named_parameters():
+                if name not in swa_state:
+                    swa_state[name] = param.detach().clone()
+                else:
+                    swa_state[name].mul_(args.swa_beta).add_(param.detach(), alpha=1.0 - args.swa_beta)
     model.zero_grad(set_to_none=True)
     train_loss_f = train_loss.item() # .item() is a CPU-GPU sync point
     synchronize()
