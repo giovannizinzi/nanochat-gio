@@ -379,7 +379,7 @@ def get_muon_momentum(it):
         return (1 - frac) * 0.85 + frac * 0.97
     elif it >= warmdown_start:
         progress = (it - warmdown_start) / warmdown_iters
-        return 0.97 * (1 - progress) + 0.90 * progress
+        return 0.97 * (1 - progress) + 0.85 * progress  # 0.90 -> 0.85 (modded-nanogpt default endpoint)
     else:
         return 0.97
 
