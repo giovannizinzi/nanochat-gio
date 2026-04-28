@@ -265,8 +265,8 @@ class GPT(nn.Module):
             for ve in self.value_embeds.values():
                 ve.to(dtype=COMPUTE_DTYPE)
 
-    def _precompute_rotary_embeddings(self, seq_len, head_dim, base=100000, device=None):
-        # TODO: bump base theta more? e.g. 100K is more common more recently
+    def _precompute_rotary_embeddings(self, seq_len, head_dim, base=500000, device=None):
+        # rope base bumped 100k -> 500k (Llama-3 / Qwen2.5 default; the TODO above suggested it).
         # autodetect the device from model embeddings
         if device is None:
             device = self.transformer.wte.weight.device
