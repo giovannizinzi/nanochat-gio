@@ -374,9 +374,9 @@ def get_lr_multiplier(it):
 def get_muon_momentum(it):
     warmdown_iters = round(args.warmdown_ratio * num_iterations)
     warmdown_start = num_iterations - warmdown_iters
-    if it < 400:
-        frac = it / 400
-        return (1 - frac) * 0.85 + frac * 0.97
+    if it < 300:
+        frac = it / 300
+        return (1 - frac) * 0.85 + frac * 0.97  # warmup 400 -> 300 steps (faster reach to peak momentum)
     elif it >= warmdown_start:
         progress = (it - warmdown_start) / warmdown_iters
         return 0.97 * (1 - progress) + 0.90 * progress
