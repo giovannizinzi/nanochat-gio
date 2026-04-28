@@ -443,7 +443,7 @@ class GPT(nn.Module):
             group["initial_lr"] = group["lr"]
         return optimizer
 
-    def forward(self, idx, targets=None, kv_cache=None, loss_reduction='mean'):
+    def forward(self, idx, targets=None, kv_cache=None, loss_reduction='mean', z_loss_coef=0.0):
         B, T = idx.size()
 
         # Grab the rotary embeddings for the current sequence length (they are of shape (1, seq_len, 1, head_dim/2))
@@ -504,7 +504,16 @@ class GPT(nn.Module):
         if targets is not None:
             # training: given the targets, compute and return the loss
             # TODO experiment with chunked cross-entropy?
-            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1, reduction=loss_reduction)
+            flat_logits = logits.view(-1, logits.size(-1))
+            flat_targets = targets.view(-1)
+            loss = F.cross_entropy(flat_logits, flat_targets, ignore_index=-1, reduction=loss_reduction)
+            if z_loss_coef > 0.0:
+                # ST-MoE z-loss: penalize squared logsumexp to keep logit partition small.
+                # Helps fp8 numerics + prevents logit drift over warmdown.
+                valid = flat_targets != -1
+                z = torch.logsumexp(flat_logits[valid], dim=-1)
+                z_loss = z_loss_coef * (z * z).mean()
+                loss = loss + z_loss
             return loss
         else:
             # inference: just return the logits directly
