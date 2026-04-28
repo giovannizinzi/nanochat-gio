@@ -376,6 +376,8 @@ class GPT(nn.Module):
         value_embeds = sum(p.numel() for p in self.value_embeds.parameters())
         lm_head = sum(p.numel() for p in self.lm_head.parameters())
         transformer_matrices = sum(p.numel() for p in self.transformer.h.parameters())
+        if hasattr(self, 'mtp_block'):
+            transformer_matrices += sum(p.numel() for p in self.mtp_block.parameters())
         scalars = self.resid_lambdas.numel() + self.x0_lambdas.numel() + self.smear_gate.weight.numel() + self.smear_lambda.numel() + self.backout_lambda.numel()
         total = wte + value_embeds + lm_head + transformer_matrices + scalars
         assert total == sum(p.numel() for p in self.parameters()), "Parameter count mismatch"
@@ -394,12 +396,17 @@ class GPT(nn.Module):
 
         # Separate out all parameters into groups
         matrix_params = list(self.transformer.h.parameters())
+        if hasattr(self, 'mtp_block'):
+            matrix_params += list(self.mtp_block.parameters())
         # When MuonClip QK-Clip is enabled, pull c_q/c_k out of matrix_params into a
         # dedicated Muon group tagged for spectral-norm capping (Kimi K2 §A).
         qk_params = []
         if muon_qk_clip_tau > 0.0:
             qk_param_ids = set()
-            for block in self.transformer.h:
+            blocks_for_qk = list(self.transformer.h)
+            if hasattr(self, 'mtp_block'):
+                blocks_for_qk.append(self.mtp_block)
+            for block in blocks_for_qk:
                 qk_params.append(block.attn.c_q.weight)
                 qk_params.append(block.attn.c_k.weight)
                 qk_param_ids.add(id(block.attn.c_q.weight))
