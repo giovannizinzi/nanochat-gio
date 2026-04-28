@@ -506,11 +506,11 @@ class GPT(nn.Module):
             loss = F.cross_entropy(flat_logits, flat_targets, ignore_index=-1, reduction=loss_reduction)
             if z_loss_coef > 0.0:
                 # ST-MoE z-loss: penalize squared logsumexp to keep logit partition small.
-                # Helps fp8 numerics + prevents logit drift over warmdown.
-                valid = flat_targets != -1
-                z = torch.logsumexp(flat_logits[valid], dim=-1)
-                z_loss = z_loss_coef * (z * z).mean()
-                loss = loss + z_loss
+                # Helps fp8 numerics + prevents logit drift over warmdown. No boolean
+                # masking — padded positions add a small uniform bias which is OK for a
+                # regularizer (avoids the expensive copy from flat_logits[mask]).
+                z = torch.logsumexp(flat_logits, dim=-1)
+                loss = loss + z_loss_coef * (z * z).mean()
             return loss
         else:
             # inference: just return the logits directly
