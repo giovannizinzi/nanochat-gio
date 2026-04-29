@@ -35,19 +35,26 @@ def adamw_step_fused(
     Fused AdamW step: weight_decay -> momentum_update -> bias_correction -> param_update
     All in one compiled graph to eliminate Python overhead between ops.
     The 0-D CPU tensors avoid recompilation when hyperparameter values change.
+
+    Cautious weight decay (modded-nanogpt PR #154 / #172): WD only on params where the
+    upcoming Adam update agrees in sign with the param. Free at runtime; gives the
+    optimizer a chance to keep params it's already pushing toward zero.
     """
-    # Weight decay (decoupled, applied before the update)
-    p.mul_(1 - lr_t * wd_t)
-    # Update running averages (lerp_ is cleaner and fuses well)
+    # Update running averages first so we can compute the cautious mask off the actual update
     exp_avg.lerp_(grad, 1 - beta1_t)
     exp_avg_sq.lerp_(grad.square(), 1 - beta2_t)
     # Bias corrections
     bias1 = 1 - beta1_t ** step_t
     bias2 = 1 - beta2_t ** step_t
-    # Compute update and apply
+    # Compute the Adam update direction
     denom = (exp_avg_sq / bias2).sqrt() + eps_t
+    update = exp_avg / denom  # pre-LR Adam update direction
+    # Cautious weight decay: only decay where update and param share sign
+    cautious_mask = (update * p) >= 0
+    p.mul_(1 - lr_t * wd_t * cautious_mask.to(p.dtype))
+    # Apply the Adam update
     step_size = lr_t / bias1
-    p.add_(exp_avg / denom, alpha=-step_size)
+    p.add_(update, alpha=-step_size)
 
 # -----------------------------------------------------------------------------
 """
