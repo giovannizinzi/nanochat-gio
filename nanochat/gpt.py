@@ -78,6 +78,10 @@ class CausalSelfAttention(nn.Module):
         self.c_proj = Linear(self.n_embd, self.n_embd, bias=False)
         self.ve_gate_channels = 12
         self.ve_gate = Linear(self.ve_gate_channels, self.n_kv_head, bias=False) if has_ve(layer_idx, config.n_layer) else None
+        # Sparse attention gate (modded-nanogpt PR #117): per-head sigmoid gate on attention output,
+        # input-conditioned on the first 12 channels. Lets each head no-op when context says so.
+        self.sa_gate_channels = 12
+        self.sa_gate = Linear(self.sa_gate_channels, self.n_head, bias=False)
 
     def forward(self, x, ve, cos_sin, window_size, kv_cache):
         B, T, C = x.size()
@@ -120,6 +124,9 @@ class CausalSelfAttention(nn.Module):
             if self.layer_idx == kv_cache.n_layers - 1:
                 kv_cache.advance(T)
 
+        # Sparse attention gate: per-head scalar gate on attention output (PR #117)
+        sa_gate = torch.sigmoid(self.sa_gate(x[..., :self.sa_gate_channels]))  # (B, T, n_head), range (0, 1)
+        y = y * sa_gate.unsqueeze(-1)
         # Re-assemble the heads and project back to residual stream
         y = y.contiguous().view(B, T, -1)
         y = self.c_proj(y)
@@ -251,6 +258,7 @@ class GPT(nn.Module):
         for block in self.transformer.h:
             if block.attn.ve_gate is not None:
                 torch.nn.init.uniform_(block.attn.ve_gate.weight, 0.0, 0.02)
+            torch.nn.init.uniform_(block.attn.sa_gate.weight, 0.0, 0.02)  # sparse-attn gate
 
         # Rotary embeddings
         head_dim = self.config.n_embd // self.config.n_head
