@@ -221,11 +221,37 @@ class GPT(nn.Module):
         # Transformer blocks: uniform init with bound = sqrt(3) * std (same standard deviation as normal)
         n_embd = self.config.n_embd
         s = 3**0.5 * n_embd**-0.5 # sqrt(3) multiplier makes sure Uniform achieves the same std as Normal
+        # Mimetic V/O init (Trockman & Kolter arxiv 2305.09828, modded-nanogpt PR #214):
+        # init c_v as +sqrt(beta) * per-head identity, c_proj as -sqrt(beta) * per-head identity,
+        # plus small Gaussian noise. Skips the wasted "break the zero-init symmetry" phase.
+        # beta=0.05 stable; >=0.10 destabilized in PR #214.
+        sqrt_beta = 0.05 ** 0.5
+        head_dim = self.config.n_embd // self.config.n_head
+        n_kv_head = self.config.n_kv_head
+        n_head = self.config.n_head
+        eye = torch.eye(head_dim)
         for block in self.transformer.h:
             torch.nn.init.uniform_(block.attn.c_q.weight, -s, s) # weights use Uniform to avoid outliers
             torch.nn.init.uniform_(block.attn.c_k.weight, -s, s)
-            torch.nn.init.uniform_(block.attn.c_v.weight, -s, s)
-            torch.nn.init.zeros_(block.attn.c_proj.weight) # projections are zero
+            with torch.no_grad():
+                # c_v: shape (n_kv_head*head_dim, n_embd). Place +sqrt_beta*I per kv-head slot.
+                v_w = block.attn.c_v.weight
+                v_w.zero_()
+                for h in range(n_kv_head):
+                    rs = h * head_dim
+                    cs = h * head_dim
+                    if cs + head_dim <= n_embd:
+                        v_w[rs:rs + head_dim, cs:cs + head_dim] = sqrt_beta * eye
+                v_w.add_(s * 0.1 * torch.randn_like(v_w))
+                # c_proj: shape (n_embd, n_head*head_dim). Place -sqrt_beta*I per head slot.
+                o_w = block.attn.c_proj.weight
+                o_w.zero_()
+                for h in range(n_head):
+                    rs = h * head_dim
+                    cs = h * head_dim
+                    if rs + head_dim <= n_embd:
+                        o_w[rs:rs + head_dim, cs:cs + head_dim] = -sqrt_beta * eye
+                o_w.add_(s * 0.1 * torch.randn_like(o_w))
             torch.nn.init.uniform_(block.mlp.c_fc.weight, -s * 0.4, s * 0.4)  # 0.4x init scale for c_fc
             torch.nn.init.zeros_(block.mlp.c_proj.weight)
 
