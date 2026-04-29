@@ -503,13 +503,18 @@ class GPT(nn.Module):
             # mtp_loss_weights[0] is for offset +1 (standard); index i for offset +(i+1).
             loss = mtp_loss_weights[0] * F.cross_entropy(
                 flat_logits, targets.view(-1), ignore_index=-1, reduction=loss_reduction)
+            T = targets.size(1)
+            positions = torch.arange(T, device=targets.device)
             for i in range(1, len(mtp_loss_weights)):
                 if mtp_loss_weights[i] == 0.0:
                     continue
-                shifted = torch.roll(targets, shifts=-i, dims=1)
-                shifted[:, -i:] = -1  # last i positions have no valid +(i+1) target
+                rolled = torch.roll(targets, shifts=-i, dims=1)
+                # Mask last i positions to -1 (no valid +(i+1) target). Functional form
+                # avoids in-place modification on the rolled tensor (which broke FP8/DDP path).
+                last_i_mask = positions >= (T - i)  # (T,)
+                shifted = torch.where(last_i_mask, torch.full_like(rolled, -1), rolled)
                 aux = F.cross_entropy(
-                    flat_logits, shifted.view(-1), ignore_index=-1, reduction=loss_reduction)
+                    flat_logits, shifted.reshape(-1), ignore_index=-1, reduction=loss_reduction)
                 loss = loss + mtp_loss_weights[i] * aux
             return loss
         else:
