@@ -149,6 +149,11 @@ def tokenizing_distributed_data_loader_with_state_bos_bestfit(
                     doc = doc_buffer.pop(shortest_idx)
                     row_buffer[row_idx, pos:pos + remaining] = torch.tensor(doc[:remaining], dtype=torch.long)
                     pos += remaining
+                    # Remainder reuse (PR #544 / handsomesun): leftover tokens prepended with
+                    # BOS go back to the buffer for future rows. Drops crop waste ~35%→~23%.
+                    leftover = doc[remaining:]
+                    if len(leftover) > 1:
+                        doc_buffer.append([bos_token] + leftover)
 
         # Copy to pinned CPU buffer, then single HtoD transfer
         cpu_inputs.copy_(row_buffer[:, :-1])
