@@ -68,6 +68,7 @@ parser.add_argument("--scalar-lr", type=float, default=0.5, help="learning rate 
 parser.add_argument("--warmup-steps", type=int, default=40, help="number of steps for LR warmup")
 parser.add_argument("--warmdown-ratio", type=float, default=0.65, help="ratio of iterations for LR warmdown")
 parser.add_argument("--final-lr-frac", type=float, default=0.05, help="final LR as fraction of initial LR")
+parser.add_argument("--warmdown-shape", type=str, default="linear", choices=["linear", "sqrt", "cubic", "cosine"], help="warmdown curve shape (MiniCPM4 recommends sqrt for ≤2B dense)")
 parser.add_argument("--resume-from-step", type=int, default=-1, help="resume training from this step (-1 = disable)")
 # Evaluation
 parser.add_argument("--eval-every", type=int, default=250, help="evaluate val bpb every N steps (-1 = disable)")
@@ -367,8 +368,18 @@ def get_lr_multiplier(it):
     elif it <= num_iterations - warmdown_iters:
         return 1.0
     else:
-        progress = (num_iterations - it) / warmdown_iters
-        return progress * 1.0 + (1 - progress) * args.final_lr_frac
+        progress = (num_iterations - it) / warmdown_iters  # 1.0 at warmdown start, 0.0 at end
+        if args.warmdown_shape == "linear":
+            shape = progress
+        elif args.warmdown_shape == "sqrt":
+            shape = progress ** 0.5  # MiniCPM4 recommendation: faster early, slower late
+        elif args.warmdown_shape == "cubic":
+            shape = progress ** 3  # holds high LR longer, drops fast at end
+        elif args.warmdown_shape == "cosine":
+            shape = 0.5 * (1.0 + math.cos(math.pi * (1.0 - progress)))  # smooth-cosine
+        else:
+            shape = progress
+        return shape * 1.0 + (1 - shape) * args.final_lr_frac
 
 # Momentum scheduler for Muon optimizer (warms up to 0.97, warms down to 0.90 during LR warmdown)
 def get_muon_momentum(it):
