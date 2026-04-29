@@ -37,6 +37,10 @@ class GPTConfig:
     # Characters: L=long (full context), S=short (quarter context)
     # Examples: "L"=all full context, "SL"=alternating, "SSL"=two short then one long
     window_pattern: str = "SSSL"
+    # Bigram hash embedding (modded-nanogpt PR #201): a second embedding indexed by
+    # xor(rand_a[tok_t], rand_b[tok_{t-1}]) % bigram_size, injected into residual at every layer.
+    use_bigram: bool = False
+    bigram_size_mult: int = 1  # bigram table rows = bigram_size_mult * vocab_size
 
 
 def norm(x):
@@ -173,6 +177,12 @@ class GPT(nn.Module):
             "h": nn.ModuleList([Block(config, layer_idx) for layer_idx in range(config.n_layer)]),
         })
         self.lm_head = Linear(config.n_embd, padded_vocab_size, bias=False)
+        # Bigram hash embedding (modded-nanogpt PR #201, simplified: input-only injection)
+        if getattr(config, 'use_bigram', False):
+            self.bigram_size = max(1, config.bigram_size_mult) * padded_vocab_size
+            self.bigram_embed = nn.Embedding(self.bigram_size, config.n_embd)
+            self.register_buffer('bigram_rand_a', torch.zeros(padded_vocab_size, dtype=torch.long), persistent=False)
+            self.register_buffer('bigram_rand_b', torch.zeros(padded_vocab_size, dtype=torch.long), persistent=False)
         # Per-layer learnable scalars (inspired by modded-nanogpt)
         # resid_lambdas: scales the residual stream at each layer (init 1.0 = neutral)
         # x0_lambdas: blends initial embedding back in at each layer (init 0.0 = disabled)
@@ -217,6 +227,13 @@ class GPT(nn.Module):
         # Embedding and unembedding
         torch.nn.init.normal_(self.transformer.wte.weight, mean=0.0, std=0.8)
         torch.nn.init.normal_(self.lm_head.weight, mean=0.0, std=0.001)
+        # Bigram hash table: small init + fixed-seed random hash multipliers
+        if hasattr(self, 'bigram_embed'):
+            torch.nn.init.normal_(self.bigram_embed.weight, mean=0.0, std=0.001)
+            g = torch.Generator(device=self.bigram_embed.weight.device).manual_seed(42)
+            n_vocab = self.transformer.wte.weight.shape[0]
+            self.bigram_rand_a.copy_(torch.randint(0, self.bigram_size, (n_vocab,), generator=g, device=self.bigram_embed.weight.device))
+            self.bigram_rand_b.copy_(torch.randint(0, self.bigram_size, (n_vocab,), generator=g, device=self.bigram_embed.weight.device))
 
         # Transformer blocks: uniform init with bound = sqrt(3) * std (same standard deviation as normal)
         n_embd = self.config.n_embd
@@ -356,6 +373,8 @@ class GPT(nn.Module):
         """
         # Count each group separately (mirrors the grouping in setup_optimizers)
         wte = sum(p.numel() for p in self.transformer.wte.parameters())
+        if hasattr(self, 'bigram_embed'):
+            wte += self.bigram_embed.weight.numel()
         value_embeds = sum(p.numel() for p in self.value_embeds.parameters())
         lm_head = sum(p.numel() for p in self.lm_head.parameters())
         transformer_matrices = sum(p.numel() for p in self.transformer.h.parameters())
@@ -390,6 +409,8 @@ class GPT(nn.Module):
             matrix_params = [p for p in matrix_params if id(p) not in qk_param_ids]
         value_embeds_params = list(self.value_embeds.parameters())
         embedding_params = list(self.transformer.wte.parameters())
+        if hasattr(self, 'bigram_embed'):
+            embedding_params += list(self.bigram_embed.parameters())
         lm_head_params = list(self.lm_head.parameters())
         resid_params = [self.resid_lambdas]
         x0_params = [self.x0_lambdas]
@@ -446,6 +467,13 @@ class GPT(nn.Module):
 
         # Embed the tokens
         x = self.transformer.wte(idx) # embed current token
+        # Bigram hash embedding (modded-nanogpt PR #201): xor-hashed bigram lookup added to input.
+        # Captures (tok_t, tok_{t-1}) pair statistics outside the model's contextual computation.
+        if hasattr(self, 'bigram_embed'):
+            prev_idx = torch.cat([torch.zeros_like(idx[:, :1]), idx[:, :-1]], dim=1)
+            hash_idx = (self.bigram_rand_a[idx] ^ self.bigram_rand_b[prev_idx]) % self.bigram_size
+            bigram_x = self.bigram_embed(hash_idx)
+            x = x + bigram_x
         x = x.to(COMPUTE_DTYPE) # ensure activations are in compute dtype (no-op usually, but active for fp16 code path)
         x = norm(x)
 
