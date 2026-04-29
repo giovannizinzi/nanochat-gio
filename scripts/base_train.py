@@ -76,6 +76,7 @@ parser.add_argument("--core-metric-every", type=int, default=2000, help="evaluat
 parser.add_argument("--core-metric-max-per-task", type=int, default=500, help="examples per task for CORE metric")
 parser.add_argument("--sample-every", type=int, default=2000, help="sample from model every N steps (-1 = disable)")
 parser.add_argument("--save-every", type=int, default=-1, help="save checkpoints every N steps (-1 = only at end)")
+parser.add_argument("--mtp-loss-weights", type=str, default="", help="comma-separated weights for shifted-target MTP CE loss (modded-nanogpt PR #178). Empty = disabled. Typical: '1.0,0.5,0.25'.")
 # Output
 parser.add_argument("--model-tag", type=str, default=None, help="override model tag for checkpoint directory name")
 args = parser.parse_args()
@@ -414,6 +415,11 @@ print0(f"Tokens / micro-batch / rank: {args.device_batch_size} x {args.max_seq_l
 print0(f"Tokens / micro-batch: {world_tokens_per_fwdbwd:,}")
 print0(f"Total batch size {total_batch_size:,} => gradient accumulation steps: {grad_accum_steps}")
 
+# Parse MTP-as-loss weights once
+mtp_loss_weights = [float(w) for w in args.mtp_loss_weights.split(",") if w.strip()] if args.mtp_loss_weights else None
+if mtp_loss_weights:
+    print0(f"MTP-as-loss enabled: weights={mtp_loss_weights} (offsets +1 ... +{len(mtp_loss_weights)})")
+
 # Go!
 while True:
     last_step = step == num_iterations # loop runs num_iterations+1 times so that we can eval/save at the end
@@ -510,7 +516,7 @@ while True:
     synchronize()
     t0 = time.time()
     for micro_step in range(grad_accum_steps):
-        loss = model(x, y)
+        loss = model(x, y, mtp_loss_weights=mtp_loss_weights)
         train_loss = loss.detach() # for logging
         loss = loss / grad_accum_steps # each .backward() is a grad sum => normalize loss here
         if scaler is not None:

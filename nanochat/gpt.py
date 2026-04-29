@@ -433,7 +433,7 @@ class GPT(nn.Module):
             group["initial_lr"] = group["lr"]
         return optimizer
 
-    def forward(self, idx, targets=None, kv_cache=None, loss_reduction='mean'):
+    def forward(self, idx, targets=None, kv_cache=None, loss_reduction='mean', mtp_loss_weights=None):
         B, T = idx.size()
 
         # Grab the rotary embeddings for the current sequence length (they are of shape (1, seq_len, 1, head_dim/2))
@@ -493,8 +493,24 @@ class GPT(nn.Module):
 
         if targets is not None:
             # training: given the targets, compute and return the loss
-            # TODO experiment with chunked cross-entropy?
-            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1, reduction=loss_reduction)
+            flat_logits = logits.view(-1, logits.size(-1))
+            if not mtp_loss_weights or len(mtp_loss_weights) <= 1:
+                # standard next-token CE
+                loss = F.cross_entropy(flat_logits, targets.view(-1), ignore_index=-1, reduction=loss_reduction)
+                return loss
+            # MTP-as-loss (modded-nanogpt PR #178): weighted CE on the same logits at
+            # token offsets +1, +2, +3, ... (no extra params, ~0 wall-clock cost).
+            # mtp_loss_weights[0] is for offset +1 (standard); index i for offset +(i+1).
+            loss = mtp_loss_weights[0] * F.cross_entropy(
+                flat_logits, targets.view(-1), ignore_index=-1, reduction=loss_reduction)
+            for i in range(1, len(mtp_loss_weights)):
+                if mtp_loss_weights[i] == 0.0:
+                    continue
+                shifted = torch.roll(targets, shifts=-i, dims=1)
+                shifted[:, -i:] = -1  # last i positions have no valid +(i+1) target
+                aux = F.cross_entropy(
+                    flat_logits, shifted.view(-1), ignore_index=-1, reduction=loss_reduction)
+                loss = loss + mtp_loss_weights[i] * aux
             return loss
         else:
             # inference: just return the logits directly
