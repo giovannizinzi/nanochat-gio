@@ -56,11 +56,16 @@ def has_ve(layer_idx, n_layer):
 
 def apply_rotary_emb(x, cos, sin):
     assert x.ndim == 4  # multihead attention
-    d = x.shape[3] // 2
-    x1, x2 = x[..., :d], x[..., d:] # split up last dim into two halves
-    y1 = x1 * cos + x2 * sin # rotate pairs of dims
-    y2 = x1 * (-sin) + x2 * cos
-    return torch.cat([y1, y2], 3)
+    # Partial RoPE (Llama 4 / Cohere convention): rotate only the first half of head_dim,
+    # leave the second half un-rotated (positional info concentrated in low-dim subspace).
+    d = x.shape[3] // 2  # rotary dim = head_dim / 2 of the FIRST half (so d = head_dim/4)
+    rot_dim = d  # how many dims to rotate; rest is identity
+    x1, x2, x_unrot = x[..., :rot_dim], x[..., rot_dim:2*rot_dim], x[..., 2*rot_dim:]
+    cos_r = cos[..., :rot_dim] if cos.shape[-1] >= rot_dim else cos
+    sin_r = sin[..., :rot_dim] if sin.shape[-1] >= rot_dim else sin
+    y1 = x1 * cos_r + x2 * sin_r
+    y2 = x1 * (-sin_r) + x2 * cos_r
+    return torch.cat([y1, y2, x_unrot], dim=3)
 
 class CausalSelfAttention(nn.Module):
     def __init__(self, config, layer_idx):
