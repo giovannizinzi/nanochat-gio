@@ -214,8 +214,10 @@ class MuonAdamW(torch.optim.Optimizer):
             - For AdamW groups: 'lr', 'betas', 'eps', 'weight_decay'
             - For Muon groups: 'lr', 'momentum', 'ns_steps', 'beta2', 'weight_decay'
     """
-    def __init__(self, param_groups: list[dict]):
+    def __init__(self, param_groups: list[dict], adam_every: int = 1):
         super().__init__(param_groups, defaults={})
+        self.adam_every = adam_every  # PR #190 modded-nanogpt: skip Adam on non-aligned steps
+        self._global_step = 0
         # 0-D CPU tensors to avoid torch.compile recompilation when values change
         # AdamW tensors
         self._adamw_step_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
@@ -321,9 +323,18 @@ class MuonAdamW(torch.optim.Optimizer):
 
     @torch.no_grad()
     def step(self):
+        self._global_step += 1
+        run_adam = (self._global_step % self.adam_every) == 0  # PR #190
         for group in self.param_groups:
             if group['kind'] == 'adamw':
-                self._step_adamw(group)
+                if run_adam:
+                    # Scale LR by adam_every to keep effective per-token LR same as default
+                    saved_lr = group['lr']
+                    group['lr'] = saved_lr * self.adam_every
+                    try:
+                        self._step_adamw(group)
+                    finally:
+                        group['lr'] = saved_lr
             elif group['kind'] == 'muon':
                 self._step_muon(group)
             else:
@@ -393,8 +404,10 @@ class DistMuonAdamW(torch.optim.Optimizer):
             - For AdamW groups: 'lr', 'betas', 'eps', 'weight_decay'
             - For Muon groups: 'lr', 'momentum', 'ns_steps', 'beta2', 'weight_decay'
     """
-    def __init__(self, param_groups: list[dict]):
+    def __init__(self, param_groups: list[dict], adam_every: int = 1):
         super().__init__(param_groups, defaults={})
+        self.adam_every = adam_every  # PR #190 modded-nanogpt: skip Adam on non-aligned steps
+        self._global_step = 0
         # 0-D CPU tensors to avoid torch.compile recompilation when values change
         self._adamw_step_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
         self._adamw_lr_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
@@ -549,12 +562,17 @@ class DistMuonAdamW(torch.optim.Optimizer):
     def step(self):
         rank = dist.get_rank()
         world_size = dist.get_world_size()
+        self._global_step += 1
+        run_adam = (self._global_step % self.adam_every) == 0  # PR #190
 
         # Phase 1: launch all async reduce ops
         reduce_infos: list[dict] = []
         for group in self.param_groups:
             if group['kind'] == 'adamw':
-                reduce_infos.append(self._reduce_adamw(group, world_size))
+                if run_adam:
+                    reduce_infos.append(self._reduce_adamw(group, world_size))
+                else:
+                    reduce_infos.append(None)  # placeholder so zip still aligns
             elif group['kind'] == 'muon':
                 reduce_infos.append(self._reduce_muon(group, world_size))
             else:
@@ -564,7 +582,13 @@ class DistMuonAdamW(torch.optim.Optimizer):
         gather_list: list[dict] = []
         for group, info in zip(self.param_groups, reduce_infos):
             if group['kind'] == 'adamw':
-                self._compute_adamw(group, info, gather_list, rank, world_size)
+                if info is not None:
+                    saved_lr = group['lr']
+                    group['lr'] = saved_lr * self.adam_every  # rescale for skipped steps
+                    try:
+                        self._compute_adamw(group, info, gather_list, rank, world_size)
+                    finally:
+                        group['lr'] = saved_lr
             elif group['kind'] == 'muon':
                 self._compute_muon(group, info, gather_list, rank)
             else:
