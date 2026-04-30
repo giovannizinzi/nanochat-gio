@@ -37,6 +37,9 @@ class GPTConfig:
     # Characters: L=long (full context), S=short (quarter context)
     # Examples: "L"=all full context, "SL"=alternating, "SSL"=two short then one long
     window_pattern: str = "SSSL"
+    # Drop the first attention layer entirely (modded-nanogpt PR #131): layer-0 attention
+    # contributes negligible signal; replace with pure-MLP block.
+    drop_first_attn: bool = False
 
 
 def norm(x):
@@ -142,11 +145,15 @@ class MLP(nn.Module):
 class Block(nn.Module):
     def __init__(self, config, layer_idx):
         super().__init__()
-        self.attn = CausalSelfAttention(config, layer_idx)
+        self.layer_idx = layer_idx
+        # Drop first attention layer (modded-nanogpt PR #131): self.attn = None at layer 0
+        drop_attn = bool(getattr(config, 'drop_first_attn', False)) and (layer_idx == 0)
+        self.attn = None if drop_attn else CausalSelfAttention(config, layer_idx)
         self.mlp = MLP(config)
 
     def forward(self, x, ve, cos_sin, window_size, kv_cache):
-        x = x + self.attn(norm(x), ve, cos_sin, window_size, kv_cache)
+        if self.attn is not None:
+            x = x + self.attn(norm(x), ve, cos_sin, window_size, kv_cache)
         x = x + self.mlp(norm(x))
         return x
 
@@ -222,10 +229,11 @@ class GPT(nn.Module):
         n_embd = self.config.n_embd
         s = 3**0.5 * n_embd**-0.5 # sqrt(3) multiplier makes sure Uniform achieves the same std as Normal
         for block in self.transformer.h:
-            torch.nn.init.uniform_(block.attn.c_q.weight, -s, s) # weights use Uniform to avoid outliers
-            torch.nn.init.uniform_(block.attn.c_k.weight, -s, s)
-            torch.nn.init.uniform_(block.attn.c_v.weight, -s, s)
-            torch.nn.init.zeros_(block.attn.c_proj.weight) # projections are zero
+            if block.attn is not None:
+                torch.nn.init.uniform_(block.attn.c_q.weight, -s, s) # weights use Uniform to avoid outliers
+                torch.nn.init.uniform_(block.attn.c_k.weight, -s, s)
+                torch.nn.init.uniform_(block.attn.c_v.weight, -s, s)
+                torch.nn.init.zeros_(block.attn.c_proj.weight) # projections are zero
             torch.nn.init.uniform_(block.mlp.c_fc.weight, -s * 0.4, s * 0.4)  # 0.4x init scale for c_fc
             torch.nn.init.zeros_(block.mlp.c_proj.weight)
 
@@ -249,7 +257,7 @@ class GPT(nn.Module):
 
         # Gate weights init with small positive values so gates start slightly above neutral
         for block in self.transformer.h:
-            if block.attn.ve_gate is not None:
+            if block.attn is not None and block.attn.ve_gate is not None:
                 torch.nn.init.uniform_(block.attn.ve_gate.weight, 0.0, 0.02)
 
         # Rotary embeddings
