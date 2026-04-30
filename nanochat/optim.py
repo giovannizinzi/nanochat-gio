@@ -328,13 +328,7 @@ class MuonAdamW(torch.optim.Optimizer):
         for group in self.param_groups:
             if group['kind'] == 'adamw':
                 if run_adam:
-                    # Scale LR by adam_every to keep effective per-token LR same as default
-                    saved_lr = group['lr']
-                    group['lr'] = saved_lr * self.adam_every
-                    try:
-                        self._step_adamw(group)
-                    finally:
-                        group['lr'] = saved_lr
+                    self._step_adamw(group)
             elif group['kind'] == 'muon':
                 self._step_muon(group)
             else:
@@ -583,12 +577,7 @@ class DistMuonAdamW(torch.optim.Optimizer):
         for group, info in zip(self.param_groups, reduce_infos):
             if group['kind'] == 'adamw':
                 if info is not None:
-                    saved_lr = group['lr']
-                    group['lr'] = saved_lr * self.adam_every  # rescale for skipped steps
-                    try:
-                        self._compute_adamw(group, info, gather_list, rank, world_size)
-                    finally:
-                        group['lr'] = saved_lr
+                    self._compute_adamw(group, info, gather_list, rank, world_size)
             elif group['kind'] == 'muon':
                 self._compute_muon(group, info, gather_list, rank)
             else:
