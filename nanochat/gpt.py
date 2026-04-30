@@ -391,6 +391,8 @@ class GPT(nn.Module):
         if muon_qk_clip_tau > 0.0:
             qk_param_ids = set()
             for block in self.transformer.h:
+                if block.attn is None:  # drop_first_attn skips layer-0 attn
+                    continue
                 qk_params.append(block.attn.c_q.weight)
                 qk_params.append(block.attn.c_k.weight)
                 qk_param_ids.add(id(block.attn.c_q.weight))
