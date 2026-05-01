@@ -40,6 +40,11 @@ class GPTConfig:
     # Drop the first attention layer entirely (modded-nanogpt PR #131): layer-0 attention
     # contributes negligible signal; replace with pure-MLP block.
     drop_first_attn: bool = False
+    # Cross-document attention masking (Qwen3 §3.1, DeepSeek-V3 §4.2): block attention
+    # across BOS-separated document boundaries within packed rows.
+    cross_doc_mask: bool = False
+    # BOS token id for cross-doc mask construction (set at runtime from tokenizer).
+    bos_token_id: int = -1
 
 
 def norm(x):
@@ -82,7 +87,7 @@ class CausalSelfAttention(nn.Module):
         self.ve_gate_channels = 12
         self.ve_gate = Linear(self.ve_gate_channels, self.n_kv_head, bias=False) if has_ve(layer_idx, config.n_layer) else None
 
-    def forward(self, x, ve, cos_sin, window_size, kv_cache):
+    def forward(self, x, ve, cos_sin, window_size, kv_cache, cu_seqlens=None, max_seqlen=0):
         B, T, C = x.size()
 
         # Project the input to get queries, keys, and values
@@ -107,8 +112,20 @@ class CausalSelfAttention(nn.Module):
         # Flash Attention (FA3 on Hopper+, PyTorch SDPA fallback elsewhere)
         # window_size is (left, right) tuple: (N, 0) for causal, (-1, 0) for full context
         if kv_cache is None:
-            # Training: causal attention with optional sliding window
-            y = flash_attn.flash_attn_func(q, k, v, causal=True, window_size=window_size)
+            if cu_seqlens is not None:
+                # Cross-doc masking via varlen: pack (B, T, H, D) -> (B*T, H, D) and respect doc boundaries
+                q_flat = q.reshape(B * T, self.n_head, self.head_dim)
+                k_flat = k.reshape(B * T, self.n_kv_head, self.head_dim)
+                v_flat = v.reshape(B * T, self.n_kv_head, self.head_dim)
+                y_flat = flash_attn.flash_attn_varlen_func(
+                    q_flat, k_flat, v_flat,
+                    cu_seqlens, cu_seqlens, max_seqlen, max_seqlen,
+                    causal=True, window_size=window_size,
+                )
+                y = y_flat.view(B, T, self.n_head, self.head_dim)
+            else:
+                # Training: causal attention with optional sliding window
+                y = flash_attn.flash_attn_func(q, k, v, causal=True, window_size=window_size)
         else:
             # Inference: use flash_attn_with_kvcache which handles cache management
             k_cache, v_cache = kv_cache.get_layer_cache(self.layer_idx)
@@ -151,9 +168,9 @@ class Block(nn.Module):
         self.attn = None if drop_attn else CausalSelfAttention(config, layer_idx)
         self.mlp = MLP(config)
 
-    def forward(self, x, ve, cos_sin, window_size, kv_cache):
+    def forward(self, x, ve, cos_sin, window_size, kv_cache, cu_seqlens=None, max_seqlen=0):
         if self.attn is not None:
-            x = x + self.attn(norm(x), ve, cos_sin, window_size, kv_cache)
+            x = x + self.attn(norm(x), ve, cos_sin, window_size, kv_cache, cu_seqlens, max_seqlen)
         x = x + self.mlp(norm(x))
         return x
 
@@ -478,6 +495,25 @@ class GPT(nn.Module):
                 gate = self.smear_lambda.to(x.dtype) * torch.sigmoid(self.smear_gate(x[:, :, :24]))
                 x = x + gate * x_pre_smear
 
+        # Cross-document attention masking: build cu_seqlens from BOS positions in idx.
+        # Each row of idx is BOS-aligned with multiple docs separated by additional BOS tokens.
+        cu_seqlens, max_seqlen = None, 0
+        if kv_cache is None and getattr(self.config, 'cross_doc_mask', False) and self.config.bos_token_id >= 0:
+            is_doc_start = (idx == self.config.bos_token_id).reshape(-1)  # (B*T,) bool
+            # Force position 0 of each row to be a doc-start (rows are always BOS-aligned).
+            # Row starts: 0, T, 2T, ..., (B-1)*T
+            row_starts = torch.arange(B, device=idx.device) * T
+            is_doc_start = is_doc_start.clone()
+            is_doc_start[row_starts] = True
+            doc_ids = is_doc_start.long().cumsum(0) - 1  # (B*T,) doc index per token
+            num_docs = int(doc_ids.max().item()) + 1
+            doc_lens = torch.bincount(doc_ids, minlength=num_docs)  # (num_docs,)
+            cu_seqlens = torch.cat([
+                torch.zeros(1, dtype=torch.int32, device=idx.device),
+                doc_lens.to(torch.int32).cumsum(0),
+            ])
+            max_seqlen = int(doc_lens.max().item())
+
         # Forward the trunk of the Transformer
         x0 = x  # save initial normalized embedding for x0 residual
         n_layer = self.config.n_layer
@@ -486,7 +522,7 @@ class GPT(nn.Module):
         for i, block in enumerate(self.transformer.h):
             x = self.resid_lambdas[i] * x + self.x0_lambdas[i] * x0
             ve = self.value_embeds[str(i)](idx).to(x.dtype) if str(i) in self.value_embeds else None
-            x = block(x, ve, cos_sin, self.window_sizes[i], kv_cache)
+            x = block(x, ve, cos_sin, self.window_sizes[i], kv_cache, cu_seqlens, max_seqlen)
             if i == backout_layer:
                 x_backout = x
         # Subtract mid-layer residual to remove low-level features before logit projection

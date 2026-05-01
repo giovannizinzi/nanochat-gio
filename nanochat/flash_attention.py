@@ -177,6 +177,42 @@ def flash_attn_with_kvcache(q, k_cache, v_cache, k=None, v=None, cache_seqlens=N
     return y_sdpa.transpose(1, 2)  # back to (B, T, H, D)
 
 
+def flash_attn_varlen_func(q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k,
+                           causal=True, window_size=(-1, -1)):
+    """
+    Variable-length flash attention for cross-document masking.
+    q, k, v: (total_tokens, H, D) packed
+    cu_seqlens_q, cu_seqlens_k: (num_seqs+1,) int32 cumulative seq lengths
+    """
+    if USE_FA3:
+        return _fa3.flash_attn_varlen_func(
+            q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k,
+            causal=causal, window_size=window_size,
+        )
+    # SDPA fallback: build doc-block mask explicitly.
+    # Reconstruct seq positions per doc from cu_seqlens.
+    total_q = q.size(0)
+    H, D = q.size(1), q.size(2)
+    # doc_id[i] = which doc position i belongs to
+    seq_lens = (cu_seqlens_q[1:] - cu_seqlens_q[:-1]).tolist()
+    doc_ids = torch.repeat_interleave(
+        torch.arange(len(seq_lens), device=q.device),
+        torch.tensor(seq_lens, device=q.device),
+    )  # (total_q,)
+    # Build (total_q, total_q) mask: same doc + causal
+    same_doc = doc_ids.unsqueeze(0) == doc_ids.unsqueeze(1)  # (total_q, total_q)
+    pos = torch.cat([torch.arange(s, device=q.device) for s in seq_lens])  # within-doc position
+    causal_mask = pos.unsqueeze(0) <= pos.unsqueeze(1)  # (total_q, total_q)
+    mask = same_doc & causal_mask
+    # SDPA needs (B, H, T, D) — fake B=1 for packed
+    q_sdpa = q.unsqueeze(0).transpose(1, 2)  # (1, H, total_q, D)
+    k_sdpa = k.unsqueeze(0).transpose(1, 2)
+    v_sdpa = v.unsqueeze(0).transpose(1, 2)
+    enable_gqa = q_sdpa.size(1) != k_sdpa.size(1)
+    y = F.scaled_dot_product_attention(q_sdpa, k_sdpa, v_sdpa, attn_mask=mask, enable_gqa=enable_gqa)
+    return y.transpose(1, 2).squeeze(0)  # (total_q, H, D)
+
+
 # =============================================================================
 # Export: flash_attn module interface (drop-in replacement for FA3)
 # =============================================================================
@@ -184,4 +220,5 @@ from types import SimpleNamespace
 flash_attn = SimpleNamespace(
     flash_attn_func=flash_attn_func,
     flash_attn_with_kvcache=flash_attn_with_kvcache,
+    flash_attn_varlen_func=flash_attn_varlen_func,
 )
