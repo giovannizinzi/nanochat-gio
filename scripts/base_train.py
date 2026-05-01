@@ -250,7 +250,10 @@ def disable_fp8(model):
 # Compile the model
 
 orig_model = model # original, uncompiled model, for saving raw model state_dict and for inference/evaluation (because the shapes may change shape)
-model = torch.compile(model, dynamic=False) # the inputs to model will never change shape so dynamic=False is safe
+_dynamic_compile = args.cross_doc_mask  # cu_seqlens has dynamic shape with cross-doc-mask
+model = torch.compile(model, dynamic=_dynamic_compile)
+if _dynamic_compile:
+    print0(">>> torch.compile(dynamic=True) for cross-doc-mask cu_seqlens dynamic shape")
 
 # -----------------------------------------------------------------------------
 # Scaling laws and muP extrapolations to determine the optimal training horizon, batch size, learning rates, weight decay.
