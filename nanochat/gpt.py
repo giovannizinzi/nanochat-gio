@@ -510,7 +510,7 @@ class GPT(nn.Module):
             doc_lens = torch.bincount(doc_ids, minlength=num_docs)  # (num_docs,)
             cu_seqlens = torch.cat([
                 torch.zeros(1, dtype=torch.int32, device=idx.device),
-                doc_lens.to(torch.int32).cumsum(0),
+                doc_lens.cumsum(0, dtype=torch.int32),
             ])
             max_seqlen = int(doc_lens.max().item())
 
