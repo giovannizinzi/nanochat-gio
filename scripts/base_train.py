@@ -78,6 +78,8 @@ parser.add_argument("--core-metric-max-per-task", type=int, default=500, help="e
 parser.add_argument("--sample-every", type=int, default=2000, help="sample from model every N steps (-1 = disable)")
 parser.add_argument("--save-every", type=int, default=-1, help="save checkpoints every N steps (-1 = only at end)")
 parser.add_argument("--z-loss-coef", type=float, default=0.0, help="ST-MoE z-loss coefficient on logit logsumexp² (0=disabled, typical: 1e-4)")
+parser.add_argument("--seq-len-curriculum-frac", type=float, default=0.0, help="fraction of iters to spend at seq_len_curriculum_start before jumping to max_seq_len (0 = disabled)")
+parser.add_argument("--seq-len-curriculum-start", type=int, default=1024, help="starting seq_len for curriculum (must divide max_seq_len for clean attention)")
 # Output
 parser.add_argument("--model-tag", type=str, default=None, help="override model tag for checkpoint directory name")
 args = parser.parse_args()
@@ -509,11 +511,22 @@ while True:
 
     # -------------------------------------------------------------------------
     # single training step
+    # Sequence length curriculum: train first frac*N iters at start_T, then jump to max_seq_len.
+    # Two-phase schedule (only 2 distinct T values) keeps torch.compile cache compact.
+    if args.seq_len_curriculum_frac > 0.0 and step < int(args.seq_len_curriculum_frac * num_iterations):
+        cur_T = args.seq_len_curriculum_start
+    else:
+        cur_T = args.max_seq_len
     # evaluate the gradient
     synchronize()
     t0 = time.time()
     for micro_step in range(grad_accum_steps):
-        loss = model(x, y, z_loss_coef=args.z_loss_coef)
+        if cur_T < x.size(1):
+            x_t = x[:, :cur_T].contiguous()
+            y_t = y[:, :cur_T].contiguous()
+        else:
+            x_t, y_t = x, y
+        loss = model(x_t, y_t, z_loss_coef=args.z_loss_coef)
         train_loss = loss.detach() # for logging
         loss = loss / grad_accum_steps # each .backward() is a grad sum => normalize loss here
         if scaler is not None:
