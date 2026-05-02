@@ -78,6 +78,8 @@ parser.add_argument("--core-metric-max-per-task", type=int, default=500, help="e
 parser.add_argument("--sample-every", type=int, default=2000, help="sample from model every N steps (-1 = disable)")
 parser.add_argument("--save-every", type=int, default=-1, help="save checkpoints every N steps (-1 = only at end)")
 parser.add_argument("--z-loss-coef", type=float, default=0.0, help="ST-MoE z-loss coefficient on logit logsumexp² (0=disabled, typical: 1e-4)")
+parser.add_argument("--bs-warmup-frac", type=float, default=0.0, help="fraction of iters for BS warmup ramp from --bs-warmup-start to --total-batch-size (0=disabled)")
+parser.add_argument("--bs-warmup-start", type=int, default=262144, help="starting TBS for BS warmup; rounded down to multiple of world_tokens_per_fwdbwd")
 # Output
 parser.add_argument("--model-tag", type=str, default=None, help="override model tag for checkpoint directory name")
 args = parser.parse_args()
@@ -417,6 +419,23 @@ print0(f"Tokens / micro-batch / rank: {args.device_batch_size} x {args.max_seq_l
 print0(f"Tokens / micro-batch: {world_tokens_per_fwdbwd:,}")
 print0(f"Total batch size {total_batch_size:,} => gradient accumulation steps: {grad_accum_steps}")
 
+# BS schedule: optionally ramp from bs_warmup_start to total_batch_size over first bs_warmup_frac of iters.
+# Quantized to powers of 2 within bounds (so grad_accum_steps stays integer).
+def get_bs_grad_accum(step):
+    if args.bs_warmup_frac <= 0.0:
+        return grad_accum_steps  # constant default
+    end_step = int(args.bs_warmup_frac * num_iterations)
+    if step >= end_step:
+        return grad_accum_steps
+    # 4-stage ramp through powers of 2
+    progress = step / max(end_step, 1)
+    start_ga = max(1, args.bs_warmup_start // world_tokens_per_fwdbwd)
+    # discrete stages: start_ga, 2*start_ga, ..., grad_accum_steps
+    ratio = grad_accum_steps / start_ga
+    n_stages = max(1, int(round(math.log2(ratio))))
+    stage = min(n_stages, int(progress * (n_stages + 1)))
+    return min(grad_accum_steps, start_ga * (2 ** stage))
+
 # Go!
 while True:
     last_step = step == num_iterations # loop runs num_iterations+1 times so that we can eval/save at the end
@@ -509,13 +528,17 @@ while True:
 
     # -------------------------------------------------------------------------
     # single training step
+    # BS schedule: dynamically pick grad_accum_steps for this step (LR rescaled accordingly)
+    cur_grad_accum = get_bs_grad_accum(step)
+    cur_tbs = cur_grad_accum * world_tokens_per_fwdbwd
+    cur_bs_lr_mult = math.sqrt(cur_tbs / total_batch_size)  # smaller TBS → smaller LR (sqrt scaling)
     # evaluate the gradient
     synchronize()
     t0 = time.time()
-    for micro_step in range(grad_accum_steps):
+    for micro_step in range(cur_grad_accum):
         loss = model(x, y, z_loss_coef=args.z_loss_coef)
         train_loss = loss.detach() # for logging
-        loss = loss / grad_accum_steps # each .backward() is a grad sum => normalize loss here
+        loss = loss / cur_grad_accum # each .backward() is a grad sum => normalize loss here
         if scaler is not None:
             scaler.scale(loss).backward()
         else:
@@ -526,7 +549,7 @@ while True:
     muon_momentum = get_muon_momentum(step)
     muon_weight_decay = get_weight_decay(step)
     for group in optimizer.param_groups:
-        group["lr"] = group["initial_lr"] * lrm
+        group["lr"] = group["initial_lr"] * lrm * cur_bs_lr_mult
         if group['kind'] == 'muon':
             group["momentum"] = muon_momentum
             group["weight_decay"] = muon_weight_decay
