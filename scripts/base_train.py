@@ -78,6 +78,7 @@ parser.add_argument("--core-metric-max-per-task", type=int, default=500, help="e
 parser.add_argument("--sample-every", type=int, default=2000, help="sample from model every N steps (-1 = disable)")
 parser.add_argument("--save-every", type=int, default=-1, help="save checkpoints every N steps (-1 = only at end)")
 parser.add_argument("--z-loss-coef", type=float, default=0.0, help="ST-MoE z-loss coefficient on logit logsumexp² (0=disabled, typical: 1e-4)")
+parser.add_argument("--newton-muon", action="store_true", help="Newton-Muon-lite: input-side per-column EMA preconditioning before NS (arxiv 2604.01472 lite)")
 # Output
 parser.add_argument("--model-tag", type=str, default=None, help="override model tag for checkpoint directory name")
 args = parser.parse_args()
@@ -318,6 +319,7 @@ optimizer = model.setup_optimizer(
     matrix_lr=args.matrix_lr * batch_lr_scale,
     weight_decay=weight_decay_scaled,
     muon_qk_clip_tau=args.muon_qk_clip_tau,
+    newton_muon=args.newton_muon,
 )
 
 if resuming:

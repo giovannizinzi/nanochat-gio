@@ -89,6 +89,74 @@ polar_express_coeffs = [
 ]
 
 @torch.compile(dynamic=False, fullgraph=True)
+def newton_muon_step_fused(
+    stacked_grads: Tensor,          # (G, M, N) stacked gradients
+    stacked_params: Tensor,         # (G, M, N) stacked parameters
+    momentum_buffer: Tensor,        # (G, M, N) first moment buffer
+    second_momentum_buffer: Tensor, # (G, M, 1) or (G, 1, N) factored 2nd moment (NorMuon, after-NS)
+    input_precond_buffer: Tensor,   # (G, 1, N) per-input-col EMA of grad sq, BEFORE NS (Newton-Muon)
+    momentum_t: Tensor,             # 0-D scalar
+    lr_t: Tensor,                   # 0-D scalar
+    wd_t: Tensor,                   # 0-D scalar
+    beta2_t: Tensor,                # 0-D scalar (NorMuon EMA decay)
+    input_beta2_t: Tensor,          # 0-D scalar (input-precond EMA decay)
+    ns_steps: int,
+    red_dim: int,
+) -> None:
+    """
+    Newton-Muon-lite step: same as muon_step_fused but adds INPUT-SIDE diagonal preconditioning
+    before Polar Express. Inspired by Newton-Muon (arxiv 2604.01472) which interprets Muon as
+    Newton's method and adds (ZZ^T)^-1 right-preconditioning. We use the diagonal approximation:
+    per-input-column EMA of squared gradients, applied as `g / sqrt(diag_var + eps)` BEFORE NS.
+    """
+    # Nesterov momentum
+    momentum = momentum_t.to(stacked_grads.dtype)
+    momentum_buffer.lerp_(stacked_grads, 1 - momentum)
+    g = stacked_grads.lerp_(momentum_buffer, momentum)
+
+    # Newton-Muon-lite: input-side per-column variance EMA + preconditioning
+    input_beta2 = input_beta2_t.to(g.dtype)
+    g_col_sq = g.float().square().mean(dim=-2, keepdim=True)  # (G, 1, N)
+    input_precond_buffer.lerp_(g_col_sq.to(input_precond_buffer.dtype), 1 - input_beta2)
+    precond_factor = (input_precond_buffer.float() + 1e-8).rsqrt()  # (G, 1, N)
+    g = g * precond_factor.to(g.dtype)  # broadcast precondition before NS
+
+    # Polar express on preconditioned g
+    X = g.bfloat16() if COMPUTE_DTYPE == torch.bfloat16 else g
+    X = X / (X.norm(dim=(-2, -1), keepdim=True) * 1.01 + 1e-6)
+    if g.size(-2) > g.size(-1):
+        for a, b, c in polar_express_coeffs[:ns_steps]:
+            A = X.mT @ X
+            B = b * A + c * (A @ A)
+            X = a * X + X @ B
+    else:
+        for a, b, c in polar_express_coeffs[:ns_steps]:
+            A = X @ X.mT
+            B = b * A + c * (A @ A)
+            X = a * X + B @ X
+    g = X
+
+    # NorMuon variance reduction (after NS)
+    beta2 = beta2_t.to(g.dtype)
+    v_mean = g.float().square().mean(dim=red_dim, keepdim=True)
+    red_dim_size = g.size(red_dim)
+    v_norm_sq = v_mean.sum(dim=(-2, -1), keepdim=True) * red_dim_size
+    v_norm = v_norm_sq.sqrt()
+    second_momentum_buffer.lerp_(v_mean.to(dtype=second_momentum_buffer.dtype), 1 - beta2)
+    step_size = second_momentum_buffer.clamp_min(1e-10).rsqrt()
+    scaled_sq_sum = (v_mean * red_dim_size) * step_size.float().square()
+    v_norm_new = scaled_sq_sum.sum(dim=(-2, -1), keepdim=True).sqrt()
+    final_scale = step_size * (v_norm / v_norm_new.clamp_min(1e-10))
+    g = g * final_scale.to(g.dtype)
+
+    # Cautious WD + update
+    lr = lr_t.to(g.dtype)
+    wd = wd_t.to(g.dtype)
+    mask = (g * stacked_params) >= 0
+    stacked_params.sub_(lr * g + lr * wd * stacked_params * mask)
+
+
+@torch.compile(dynamic=False, fullgraph=True)
 def muon_step_fused(
     stacked_grads: Tensor,          # (12, 768, 3072) - stacked gradients
     stacked_params: Tensor,         # (12, 768, 3072) - stacked parameters
@@ -214,8 +282,9 @@ class MuonAdamW(torch.optim.Optimizer):
             - For AdamW groups: 'lr', 'betas', 'eps', 'weight_decay'
             - For Muon groups: 'lr', 'momentum', 'ns_steps', 'beta2', 'weight_decay'
     """
-    def __init__(self, param_groups: list[dict]):
+    def __init__(self, param_groups: list[dict], newton_muon: bool = False, newton_muon_beta2: float = 0.95):
         super().__init__(param_groups, defaults={})
+        self.newton_muon = newton_muon
         # 0-D CPU tensors to avoid torch.compile recompilation when values change
         # AdamW tensors
         self._adamw_step_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
@@ -229,6 +298,7 @@ class MuonAdamW(torch.optim.Optimizer):
         self._muon_lr_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
         self._muon_wd_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
         self._muon_beta2_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
+        self._newton_muon_input_beta2_t = torch.tensor(newton_muon_beta2, dtype=torch.float32, device="cpu")
 
     def _step_adamw(self, group: dict) -> None:
         """
@@ -292,6 +362,10 @@ class MuonAdamW(torch.optim.Optimizer):
         second_momentum_buffer = state["second_momentum_buffer"]
         red_dim = -1 if shape[-2] >= shape[-1] else -2
 
+        # Newton-Muon-lite: per-input-column EMA buffer (always (num_params, 1, in))
+        if self.newton_muon and "input_precond_buffer" not in state:
+            state["input_precond_buffer"] = torch.ones(num_params, 1, shape[-1], dtype=dtype, device=device)
+
         # Stack grads and params (NOTE: this assumes all params have the same shape)
         stacked_grads = torch.stack([p.grad for p in params])
         stacked_params = torch.stack(params)
@@ -302,19 +376,35 @@ class MuonAdamW(torch.optim.Optimizer):
         self._muon_lr_t.fill_(group["lr"] * max(1.0, shape[-2] / shape[-1])**0.5)
         self._muon_wd_t.fill_(group["weight_decay"])
 
-        # Single fused kernel: momentum -> polar_express -> variance_reduction -> update
-        muon_step_fused(
-            stacked_grads,
-            stacked_params,
-            momentum_buffer,
-            second_momentum_buffer,
-            self._muon_momentum_t,
-            self._muon_lr_t,
-            self._muon_wd_t,
-            self._muon_beta2_t,
-            group["ns_steps"],
-            red_dim,
-        )
+        # Single fused kernel: momentum -> [optional input precond] -> polar_express -> variance_reduction -> update
+        if self.newton_muon:
+            newton_muon_step_fused(
+                stacked_grads,
+                stacked_params,
+                momentum_buffer,
+                second_momentum_buffer,
+                state["input_precond_buffer"],
+                self._muon_momentum_t,
+                self._muon_lr_t,
+                self._muon_wd_t,
+                self._muon_beta2_t,
+                self._newton_muon_input_beta2_t,
+                group["ns_steps"],
+                red_dim,
+            )
+        else:
+            muon_step_fused(
+                stacked_grads,
+                stacked_params,
+                momentum_buffer,
+                second_momentum_buffer,
+                self._muon_momentum_t,
+                self._muon_lr_t,
+                self._muon_wd_t,
+                self._muon_beta2_t,
+                group["ns_steps"],
+                red_dim,
+            )
 
         # Copy back to original params
         torch._foreach_copy_(params, list(stacked_params.unbind(0)))
@@ -393,8 +483,9 @@ class DistMuonAdamW(torch.optim.Optimizer):
             - For AdamW groups: 'lr', 'betas', 'eps', 'weight_decay'
             - For Muon groups: 'lr', 'momentum', 'ns_steps', 'beta2', 'weight_decay'
     """
-    def __init__(self, param_groups: list[dict]):
+    def __init__(self, param_groups: list[dict], newton_muon: bool = False, newton_muon_beta2: float = 0.95):
         super().__init__(param_groups, defaults={})
+        self.newton_muon = newton_muon
         # 0-D CPU tensors to avoid torch.compile recompilation when values change
         self._adamw_step_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
         self._adamw_lr_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
@@ -406,6 +497,7 @@ class DistMuonAdamW(torch.optim.Optimizer):
         self._muon_lr_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
         self._muon_wd_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
         self._muon_beta2_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
+        self._newton_muon_input_beta2_t = torch.tensor(newton_muon_beta2, dtype=torch.float32, device="cpu")
 
     def _reduce_adamw(self, group: dict, world_size: int) -> dict:
         """Launch async reduce ops for AdamW group. Returns info dict with per-param infos."""
@@ -507,6 +599,8 @@ class DistMuonAdamW(torch.optim.Optimizer):
         if "second_momentum_buffer" not in state:
             state_shape = (chunk_size, shape[-2], 1) if shape[-2] >= shape[-1] else (chunk_size, 1, shape[-1])
             state["second_momentum_buffer"] = torch.zeros(state_shape, dtype=dtype, device=device)
+        if self.newton_muon and "input_precond_buffer" not in state:
+            state["input_precond_buffer"] = torch.ones(chunk_size, 1, shape[-1], dtype=dtype, device=device)
         red_dim = -1 if shape[-2] >= shape[-1] else -2
 
         # Build output buffer for all_gather
@@ -521,12 +615,22 @@ class DistMuonAdamW(torch.optim.Optimizer):
             self._muon_beta2_t.fill_(group["beta2"])
             self._muon_lr_t.fill_(group["lr"] * max(1.0, shape[-2] / shape[-1])**0.5)
             self._muon_wd_t.fill_(group["weight_decay"])
-            muon_step_fused(
-                grad_chunk[:num_owned], stacked_owned,
-                state["momentum_buffer"][:num_owned], state["second_momentum_buffer"][:num_owned],
-                self._muon_momentum_t, self._muon_lr_t, self._muon_wd_t, self._muon_beta2_t,
-                group["ns_steps"], red_dim,
-            )
+            if self.newton_muon:
+                newton_muon_step_fused(
+                    grad_chunk[:num_owned], stacked_owned,
+                    state["momentum_buffer"][:num_owned], state["second_momentum_buffer"][:num_owned],
+                    state["input_precond_buffer"][:num_owned],
+                    self._muon_momentum_t, self._muon_lr_t, self._muon_wd_t, self._muon_beta2_t,
+                    self._newton_muon_input_beta2_t,
+                    group["ns_steps"], red_dim,
+                )
+            else:
+                muon_step_fused(
+                    grad_chunk[:num_owned], stacked_owned,
+                    state["momentum_buffer"][:num_owned], state["second_momentum_buffer"][:num_owned],
+                    self._muon_momentum_t, self._muon_lr_t, self._muon_wd_t, self._muon_beta2_t,
+                    group["ns_steps"], red_dim,
+                )
             updated_params[:num_owned].copy_(stacked_owned)
 
         if num_owned < chunk_size:
