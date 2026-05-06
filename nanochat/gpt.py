@@ -472,7 +472,10 @@ class GPT(nn.Module):
         if num_moe_layers > 0:
             moe = self.transformer.h[self.config.moe_first_layer].mlp
             expert_hidden = moe.expert_hidden_dim
-            inactive_per_layer = (self.config.num_experts - self.config.top_k) * 2 * self.config.n_embd * expert_hidden
+            # SwiGLU experts have +50% w_fc params (gate+value); ReLU² has just w_fc (1x).
+            fc_mult = getattr(moe, "fc_out_mult", 1)
+            per_expert_ffn = (fc_mult + 1) * self.config.n_embd * expert_hidden
+            inactive_per_layer = (self.config.num_experts - self.config.top_k) * per_expert_ffn
             moe_inactive = inactive_per_layer * num_moe_layers
         h, q, t = self.config.n_head, self.config.n_embd // self.config.n_head, self.config.sequence_len
         # Sum attention FLOPs per layer, accounting for sliding window
@@ -513,7 +516,9 @@ class GPT(nn.Module):
         if num_moe_layers > 0:
             moe = self.transformer.h[self.config.moe_first_layer].mlp
             expert_hidden = moe.expert_hidden_dim
-            per_expert_ffn = 2 * self.config.n_embd * expert_hidden
+            # SwiGLU experts have +50% w_fc params (gate+value); ReLU² has just w_fc (1x).
+            fc_mult = getattr(moe, "fc_out_mult", 1)
+            per_expert_ffn = (fc_mult + 1) * self.config.n_embd * expert_hidden
             # Global routed-expert params (across all ranks if EP is on)
             routed_params_per_layer_global = self.config.num_experts * per_expert_ffn
             # Inactive per token = (num_experts - top_k) fraction of routed params

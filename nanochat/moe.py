@@ -138,23 +138,37 @@ class MoE(nn.Module):
         else:
             self.expert_bias = None
 
+        # FFN type for experts: "relu2" (default) or "swiglu". SwiGLU doubles w_fc out-dim
+        # to (2*H) for the gate/value split; w_proj stays (H, D). Net: +50% expert weights.
+        # Set --expert-hidden-dim=2688 to keep param-matched to ReLU² with H=4096.
+        self.ffn_type = getattr(config, "ffn_type", "relu2")
+        assert self.ffn_type in ("relu2", "swiglu"), f"Unsupported ffn_type: {self.ffn_type}"
+        self.fc_out_mult = 2 if self.ffn_type == "swiglu" else 1
+
         # Router: replicated across ranks (decision must be consistent globally).
         self.router_weight = nn.Parameter(torch.empty(self.num_experts, self.n_embd))
 
-        # Routed experts: (E_per_rank, D, H) / (E_per_rank, H, D). Under EP each rank owns
-        # a disjoint slice; under replicated mode E_per_rank == num_experts so this is full.
+        # Routed experts: (E_per_rank, D, fc_out_mult * H) / (E_per_rank, H, D). Under EP
+        # each rank owns a disjoint slice; under replicated mode E_per_rank == num_experts.
         D, H = self.n_embd, self.expert_hidden_dim
-        self.w_fc = nn.Parameter(torch.empty(self.E_per_rank, D, H))
+        self.w_fc = nn.Parameter(torch.empty(self.E_per_rank, D, self.fc_out_mult * H))
         self.w_proj = nn.Parameter(torch.empty(self.E_per_rank, H, D))
 
         # Shared experts: always active for every token, no routing — stay replicated.
         if self.num_shared_experts > 0:
             S = self.num_shared_experts
-            self.ws_fc = nn.Parameter(torch.empty(S, D, H))
+            self.ws_fc = nn.Parameter(torch.empty(S, D, self.fc_out_mult * H))
             self.ws_proj = nn.Parameter(torch.empty(S, H, D))
         else:
             self.register_parameter("ws_fc", None)
             self.register_parameter("ws_proj", None)
+
+    def _ffn_act(self, h: torch.Tensor) -> torch.Tensor:
+        """Apply expert FFN activation. ReLU² leaves shape unchanged; SwiGLU halves last dim."""
+        if self.ffn_type == "swiglu":
+            gate, value = h.chunk(2, dim=-1)
+            return F.silu(gate) * value
+        return F.relu(h).square()
 
     @torch.no_grad()
     def init_weights(self):
@@ -198,7 +212,7 @@ class MoE(nn.Module):
             sorted_expert_idxs, sorted_scattered_idxs, expert_offsets,
             grouped_out=True,
         )
-        h = F.relu(h).square()
+        h = self._ffn_act(h)
 
         # GEMM 2: grouped input × w_proj, combine via gate probs → (N, D).
         routed_out = parallel_linear(
@@ -239,11 +253,11 @@ class MoE(nn.Module):
             except Exception:
                 from nanochat.fp8 import fp8_expert_bmm as _bmm_fn
             hidden = _bmm_fn(expert_inputs, w_fc)
-            hidden = F.relu(hidden).square()
+            hidden = self._ffn_act(hidden)
             expert_output = _bmm_fn(hidden, w_proj)
         else:
             hidden = torch.bmm(expert_inputs, w_fc)
-            hidden = F.relu(hidden).square()
+            hidden = self._ffn_act(hidden)
             expert_output = torch.bmm(hidden, w_proj)
 
         # Scatter back: each (e, c) slot contributes to token top_tok_idx[e, c].
@@ -297,11 +311,11 @@ class MoE(nn.Module):
             except Exception:
                 from nanochat.fp8 import fp8_expert_bmm as _bmm_fn
             hidden = _bmm_fn(expert_inputs, w_fc)
-            hidden = F.relu(hidden).square()
+            hidden = self._ffn_act(hidden)
             expert_output = _bmm_fn(hidden, w_proj)
         else:
             hidden = torch.bmm(expert_inputs, w_fc)
-            hidden = F.relu(hidden).square()
+            hidden = self._ffn_act(hidden)
             expert_output = torch.bmm(hidden, w_proj)
 
         expert_output_flat = expert_output.view(E * capacity, D)
@@ -369,7 +383,7 @@ class MoE(nn.Module):
         w_fc = self.w_fc.to(x_flat.dtype)       # (Ep, D, H)
         w_proj = self.w_proj.to(x_flat.dtype)   # (Ep, H, D)
         hidden = torch.bmm(local_inputs, w_fc)
-        hidden = F.relu(hidden).square()
+        hidden = self._ffn_act(hidden)
         local_outputs = torch.bmm(hidden, w_proj)  # (Ep, ws*cap, D)
 
         # Reverse the transpose to prepare for all_to_all back:
@@ -398,7 +412,7 @@ class MoE(nn.Module):
         shared_out = torch.zeros_like(x_flat)
         for s in range(self.num_shared_experts):
             h = x_flat @ ws_fc[s]
-            h = F.relu(h).square()
+            h = self._ffn_act(h)
             shared_out = shared_out + h @ ws_proj[s]
         return shared_out
 
