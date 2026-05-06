@@ -96,6 +96,9 @@ class GPTConfig:
     #   y = silu(c_attn_gate(x)) * attn_out, then c_proj(y).
     # Extra params: n_embd² per block. Small compute overhead, known to stabilize attention.
     attn_output_gate: bool = False
+    # Drop first attention layer entirely (modded-nanogpt PR #131): layer-0 attention
+    # contributes negligible signal; replace with pure-MLP block. Saves ~1.7% step time.
+    drop_first_attn: bool = False
 
 
 def norm(x):
@@ -291,12 +294,18 @@ class MLP(nn.Module):
 class Block(nn.Module):
     def __init__(self, config, layer_idx):
         super().__init__()
-        self.attn = CausalSelfAttention(config, layer_idx)
+        self.layer_idx = layer_idx
+        # Drop first attention layer (modded-nanogpt PR #131): layer-0 attention contributes
+        # negligible signal; replace with pure-MLP block. Saves ~1.7% step time + reduces
+        # param count by one attention block's worth.
+        drop_attn = bool(getattr(config, 'drop_first_attn', False)) and (layer_idx == 0)
+        self.attn = None if drop_attn else CausalSelfAttention(config, layer_idx)
         self.use_moe = config.num_experts > 1 and layer_idx >= config.moe_first_layer
         self.mlp = MoE(config) if self.use_moe else MLP(config)
 
     def forward(self, x, ve, cos_sin, window_size, kv_cache, doc_mask=None):
-        x = x + self.attn(norm(x), ve, cos_sin, window_size, kv_cache, doc_mask=doc_mask)
+        if self.attn is not None:
+            x = x + self.attn(norm(x), ve, cos_sin, window_size, kv_cache, doc_mask=doc_mask)
         if self.use_moe:
             mlp_out, aux = self.mlp(norm(x))
             x = x + mlp_out
@@ -377,20 +386,23 @@ class GPT(nn.Module):
         n_embd = self.config.n_embd
         s = 3**0.5 * n_embd**-0.5 # sqrt(3) multiplier makes sure Uniform achieves the same std as Normal
         for block in self.transformer.h:
-            torch.nn.init.uniform_(block.attn.c_q.weight, -s, s) # weights use Uniform to avoid outliers
-            if block.attn.use_mla:
-                # MLA: latent projection + per-K/V decompression. Init all with the standard scale.
-                torch.nn.init.uniform_(block.attn.c_kv_a.weight, -s, s)
-                torch.nn.init.uniform_(block.attn.c_k_b.weight, -s, s)
-                torch.nn.init.uniform_(block.attn.c_v_b.weight, -s, s)
-            else:
-                torch.nn.init.uniform_(block.attn.c_k.weight, -s, s)
-                torch.nn.init.uniform_(block.attn.c_v.weight, -s, s)
-            if block.attn.use_attn_output_gate:
-                # Uniform init (same scale as c_q/c_k/c_v). v185 bug: zero-init caused
-                # silu(0)=0 which zeroed attention output and blocked gradient to Q/K/V.
-                torch.nn.init.uniform_(block.attn.c_attn_gate.weight, -s, s)
-            torch.nn.init.zeros_(block.attn.c_proj.weight) # projections are zero
+            if block.attn is not None:
+                torch.nn.init.uniform_(block.attn.c_q.weight, -s, s) # weights use Uniform to avoid outliers
+                if block.attn.use_mla:
+                    # MLA: latent projection + per-K/V decompression. Init all with the standard scale.
+                    torch.nn.init.uniform_(block.attn.c_kv_a.weight, -s, s)
+                    torch.nn.init.uniform_(block.attn.c_k_b.weight, -s, s)
+                    torch.nn.init.uniform_(block.attn.c_v_b.weight, -s, s)
+                    if block.attn.mla_v3_rope_dim > 0:
+                        torch.nn.init.uniform_(block.attn.c_k_rope.weight, -s, s)
+                else:
+                    torch.nn.init.uniform_(block.attn.c_k.weight, -s, s)
+                    torch.nn.init.uniform_(block.attn.c_v.weight, -s, s)
+                if block.attn.use_attn_output_gate:
+                    # Uniform init (same scale as c_q/c_k/c_v). v185 bug: zero-init caused
+                    # silu(0)=0 which zeroed attention output and blocked gradient to Q/K/V.
+                    torch.nn.init.uniform_(block.attn.c_attn_gate.weight, -s, s)
+                torch.nn.init.zeros_(block.attn.c_proj.weight) # projections are zero
             if block.use_moe:
                 block.mlp.init_weights()  # MoE does its own init (zero c_proj => zero contribution at init)
             else:
@@ -417,7 +429,7 @@ class GPT(nn.Module):
 
         # Gate weights init with small positive values so gates start slightly above neutral
         for block in self.transformer.h:
-            if block.attn.ve_gate is not None:
+            if block.attn is not None and block.attn.ve_gate is not None:
                 torch.nn.init.uniform_(block.attn.ve_gate.weight, 0.0, 0.02)
 
         # Rotary embeddings
@@ -618,10 +630,20 @@ class GPT(nn.Module):
         if muon_qk_clip_tau > 0.0:
             qk_param_ids = set()
             for block in self.transformer.h:
+                if block.attn is None:  # drop_first_attn skips layer-0 attn
+                    continue
+                # Always clip c_q. K source depends on attention mode (MHA/GQA vs MLA).
                 qk_params.append(block.attn.c_q.weight)
-                qk_params.append(block.attn.c_k.weight)
                 qk_param_ids.add(id(block.attn.c_q.weight))
-                qk_param_ids.add(id(block.attn.c_k.weight))
+                if block.attn.use_mla:
+                    qk_params.append(block.attn.c_k_b.weight)
+                    qk_param_ids.add(id(block.attn.c_k_b.weight))
+                    if block.attn.mla_v3_rope_dim > 0:
+                        qk_params.append(block.attn.c_k_rope.weight)
+                        qk_param_ids.add(id(block.attn.c_k_rope.weight))
+                else:
+                    qk_params.append(block.attn.c_k.weight)
+                    qk_param_ids.add(id(block.attn.c_k.weight))
             matrix_params = [p for p in matrix_params if id(p) not in qk_param_ids]
         value_embeds_params = list(self.value_embeds.parameters())
         embedding_params = list(self.transformer.wte.parameters())
