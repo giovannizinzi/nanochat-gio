@@ -87,6 +87,10 @@ class GPTConfig:
     # -> (B, T, n_kv_head, head_dim). Simplified variant without the decoupled RoPE head;
     # RoPE applies to full Q and K as usual. 0 = disabled (standard MHA/GQA via c_k/c_v).
     mla_lora_rank: int = 0
+    # DeepSeek-V3 MLA decoupled RoPE: split head_dim into nope (from latent) + rope (separate
+    # K projection bypassing latent). RoPE applies only to the rope slice. 0 = V2 simplified.
+    # Typical values: 32 or 64 (must be even and < head_dim). Requires mla_lora_rank > 0.
+    mla_v3_rope_head_dim: int = 0
     # Attention-output gate (Qwen3.6-style `attn_output_gate`). When True, apply a
     # SiLU-gated projection to the attention output before c_proj:
     #   y = silu(c_attn_gate(x)) * attn_out, then c_proj(y).
@@ -131,10 +135,23 @@ class CausalSelfAttention(nn.Module):
         # MLA: K and V decoded from a shared low-rank latent of width mla_lora_rank.
         # Otherwise: standard MHA/GQA with direct c_k, c_v projections.
         self.use_mla = getattr(config, "mla_lora_rank", 0) > 0
+        # V3 MLA: split head_dim into nope (from latent) + rope (separate K projection bypassing
+        # latent). RoPE applies only to the rope part. 0 = V2 simplified (RoPE on full head).
+        self.mla_v3_rope_dim = int(getattr(config, "mla_v3_rope_head_dim", 0)) if self.use_mla else 0
         if self.use_mla:
             self.mla_rank = config.mla_lora_rank
             self.c_kv_a = Linear(self.n_embd, self.mla_rank, bias=False)
-            self.c_k_b = Linear(self.mla_rank, self.n_kv_head * self.head_dim, bias=False)
+            if self.mla_v3_rope_dim > 0:
+                # V3: c_k_b only decodes the nope portion; c_k_rope is separate, bypasses latent.
+                assert self.mla_v3_rope_dim < self.head_dim, "mla_v3_rope_head_dim must be < head_dim"
+                assert self.mla_v3_rope_dim % 2 == 0, "mla_v3_rope_head_dim must be even"
+                self.nope_head_dim = self.head_dim - self.mla_v3_rope_dim
+                self.c_k_b = Linear(self.mla_rank, self.n_kv_head * self.nope_head_dim, bias=False)
+                self.c_k_rope = Linear(self.n_embd, self.n_kv_head * self.mla_v3_rope_dim, bias=False)
+            else:
+                # V2 simplified: full K decoded from latent, RoPE applied to full head_dim.
+                self.c_k_b = Linear(self.mla_rank, self.n_kv_head * self.head_dim, bias=False)
+            # V always full head_dim from latent (V doesn't get split in V3 either).
             self.c_v_b = Linear(self.mla_rank, self.n_kv_head * self.head_dim, bias=False)
         else:
             self.c_k = Linear(self.n_embd, self.n_kv_head * self.head_dim, bias=False)
@@ -153,14 +170,40 @@ class CausalSelfAttention(nn.Module):
         # Project the input to get queries, keys, and values
         # Shape: (B, T, H, D) - FA3's native layout, no transpose needed!
         q = self.c_q(x).view(B, T, self.n_head, self.head_dim)
-        if self.use_mla:
-            # DeepSeek-V2 style: shared low-rank latent, then per-KV decompression.
+        if self.use_mla and self.mla_v3_rope_dim > 0:
+            # DeepSeek-V3 MLA: K = [k_nope (from latent) || k_rope (separate proj)].
+            # V always from latent. RoPE applies only to the rope slice of Q and K.
             latent = self.c_kv_a(x)  # (B, T, r)
-            k = self.c_k_b(latent).view(B, T, self.n_kv_head, self.head_dim)
+            k_nope = self.c_k_b(latent).view(B, T, self.n_kv_head, self.nope_head_dim)
+            k_rope = self.c_k_rope(x).view(B, T, self.n_kv_head, self.mla_v3_rope_dim)
             v = self.c_v_b(latent).view(B, T, self.n_kv_head, self.head_dim)
+            # Split q similarly into nope/rope halves (purely an internal split — c_q is full head_dim)
+            q_nope = q[..., :self.nope_head_dim]
+            q_rope = q[..., self.nope_head_dim:]
+            if cos_sin is not None:
+                cos, sin = cos_sin
+                # cos/sin shape: (1, T, 1, head_dim/2). RoPE on rope_dim uses first rope_dim/2 freqs.
+                half_rope = self.mla_v3_rope_dim // 2
+                cos_r, sin_r = cos[..., :half_rope], sin[..., :half_rope]
+                q_rope = apply_rotary_emb(q_rope, cos_r, sin_r)
+                k_rope = apply_rotary_emb(k_rope, cos_r, sin_r)
+            # Concatenate back to full head_dim before QK-norm + attention.
+            q = torch.cat([q_nope, q_rope], dim=-1)
+            k = torch.cat([k_nope, k_rope], dim=-1)
         else:
-            k = self.c_k(x).view(B, T, self.n_kv_head, self.head_dim)
-            v = self.c_v(x).view(B, T, self.n_kv_head, self.head_dim)
+            if self.use_mla:
+                # DeepSeek-V2 style: shared low-rank latent, then per-KV decompression.
+                latent = self.c_kv_a(x)  # (B, T, r)
+                k = self.c_k_b(latent).view(B, T, self.n_kv_head, self.head_dim)
+                v = self.c_v_b(latent).view(B, T, self.n_kv_head, self.head_dim)
+            else:
+                k = self.c_k(x).view(B, T, self.n_kv_head, self.head_dim)
+                v = self.c_v(x).view(B, T, self.n_kv_head, self.head_dim)
+            # Apply Rotary Embeddings to queries and keys (full head_dim) to get relative
+            # positional encoding. cos_sin is None when config.use_rope=False (NoPE).
+            if cos_sin is not None:
+                cos, sin = cos_sin
+                q, k = apply_rotary_emb(q, cos, sin), apply_rotary_emb(k, cos, sin)
 
         # Value residual (ResFormer): mix in value embedding with input-dependent gate per head
         if ve is not None:
@@ -168,11 +211,6 @@ class CausalSelfAttention(nn.Module):
             gate = 3 * torch.sigmoid(self.ve_gate(x[..., :self.ve_gate_channels]))  # (B, T, n_kv_head), range (0, 3)
             v = v + gate.unsqueeze(-1) * ve
 
-        # Apply Rotary Embeddings to queries and keys to get relative positional encoding.
-        # cos_sin is None when config.use_rope=False (NoPE — causal mask encodes position).
-        if cos_sin is not None:
-            cos, sin = cos_sin
-            q, k = apply_rotary_emb(q, cos, sin), apply_rotary_emb(k, cos, sin)
         q, k = norm(q), norm(k) # QK norm
         q = q * 1.2  # sharper attention (split scale between Q and K), TODO think through better
         k = k * 1.2
@@ -395,8 +433,9 @@ class GPT(nn.Module):
             for ve in self.value_embeds.values():
                 ve.to(dtype=COMPUTE_DTYPE)
 
-    def _precompute_rotary_embeddings(self, seq_len, head_dim, base=100000, device=None):
-        # TODO: bump base theta more? e.g. 100K is more common more recently
+    def _precompute_rotary_embeddings(self, seq_len, head_dim, base=500000, device=None):
+        # RoPE base 500K (Llama-3 / Qwen2.5 / DeepSeek default). Confirmed +0.013 CORE lift
+        # vs default 100K in Run 7 alpha hunt (3-sample mean p<0.05).
         # autodetect the device from model embeddings
         if device is None:
             device = self.transformer.wte.weight.device
