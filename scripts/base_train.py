@@ -80,6 +80,7 @@ parser.add_argument("--chunked-ce-chunk-size", type=int, default=0, help="Chunk 
 parser.add_argument("--mla-lora-rank", type=int, default=0, help="MLA (DeepSeek-V2 latent attention). K/V decoded from shared low-rank latent of width r. 0 = disabled. Typical: 256 or 384.")
 parser.add_argument("--mla-v3-rope-head-dim", type=int, default=0, help="DeepSeek-V3 MLA decoupled RoPE: split head_dim into nope (from latent) + rope (separate K). 0 = V2 simplified. Typical: 32 or 64.")
 parser.add_argument("--attn-output-gate", action="store_true", help="Qwen3.6-style SiLU gate on attention output before c_proj. +n_embd^2 params/block.")
+parser.add_argument("--drop-first-attn", action="store_true", help="Drop layer-0 attention entirely (modded-nanogpt PR #131). Saves ~1.7% step time + reduces param count.")
 # Training horizon (only one used, in order of precedence)
 parser.add_argument("--num-iterations", type=int, default=-1, help="explicit number of optimization steps (-1 = disable)")
 parser.add_argument("--target-flops", type=float, default=-1.0, help="calculate num_iterations to reach target_flops (-1 = disable)")
@@ -199,6 +200,7 @@ def build_model_meta(depth):
         mla_lora_rank=args.mla_lora_rank,
         mla_v3_rope_head_dim=args.mla_v3_rope_head_dim,
         attn_output_gate=args.attn_output_gate,
+        drop_first_attn=args.drop_first_attn,
     )
     with torch.device("meta"):
         model_meta = GPT(config)
