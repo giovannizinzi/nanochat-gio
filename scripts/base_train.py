@@ -105,10 +105,15 @@ parser.add_argument("--core-metric-every", type=int, default=2000, help="evaluat
 parser.add_argument("--core-metric-max-per-task", type=int, default=500, help="examples per task for CORE metric")
 parser.add_argument("--sample-every", type=int, default=2000, help="sample from model every N steps (-1 = disable)")
 parser.add_argument("--save-every", type=int, default=-1, help="save checkpoints every N steps (-1 = only at end)")
+parser.add_argument("--save-at-steps", type=str, default="", help="comma-separated list of explicit steps at which to save a checkpoint (e.g. '16500,33000'). Final-step save still applies via last_step.")
 # Output
 parser.add_argument("--model-tag", type=str, default=None, help="override model tag for checkpoint directory name")
 args = parser.parse_args()
 user_config = vars(args).copy()  # for logging
+# Pre-parse save-at-steps once so the per-step check is a fast set lookup.
+_SAVE_AT_STEPS_SET = set()
+if args.save_at_steps:
+    _SAVE_AT_STEPS_SET = {int(s.strip()) for s in args.save_at_steps.split(",") if s.strip()}
 # -----------------------------------------------------------------------------
 # Compute init and wandb logging
 
@@ -544,8 +549,10 @@ while True:
             print0(tokenizer.decode(sample[0]))
         model.train()
 
-    # save checkpoint: at the end of the run, or every save_every steps, except at the first step or the resume step
-    if last_step or (step > 0 and step != args.resume_from_step and args.save_every > 0 and step % args.save_every == 0):
+    # save checkpoint: at the end of the run, every save_every steps, or at any explicit step
+    # listed in --save-at-steps. Skips the first step and the resume step.
+    save_at_explicit = step in _SAVE_AT_STEPS_SET if step > 0 and step != args.resume_from_step else False
+    if last_step or save_at_explicit or (step > 0 and step != args.resume_from_step and args.save_every > 0 and step % args.save_every == 0):
         save_checkpoint(
             checkpoint_dir,
             step,
